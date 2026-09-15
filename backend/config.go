@@ -139,6 +139,11 @@ func loadConfig() Config {
 	case !cfg.AILive && cfg.OpenAIKey != "":
 		log.Printf("config: AI_LIVE=false overrides the OPENAI_API_KEY that is set; staying in MOCK mode")
 	}
+	// A bad DEFAULT_TIMEZONE would be inherited by every new user.
+	if resolved := resolveTimezone(cfg.DefaultTimezone, "UTC"); resolved != cfg.DefaultTimezone {
+		log.Printf("config: DEFAULT_TIMEZONE=%q is not a known IANA zone; using %s", cfg.DefaultTimezone, resolved)
+		cfg.DefaultTimezone = resolved
+	}
 	if cfg.AllowHeaderAuth {
 		log.Printf("config: ALLOW_HEADER_AUTH=true accepts an unverified X-User-Id header as identity; do not use this in production")
 	}

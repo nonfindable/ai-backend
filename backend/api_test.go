@@ -16,14 +16,25 @@ import (
 type testServer struct {
 	*httptest.Server
 	store *Store
+	sched *Scheduler
 }
 
 func newTestServer(t *testing.T) *testServer {
+	t.Helper()
+	return newTestServerCfg(t, nil)
+}
+
+// newTestServerCfg builds a server whose config the caller can adjust, so a test
+// can run the API in live mode against a fake upstream.
+func newTestServerCfg(t *testing.T, mutate func(*Config)) *testServer {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := Config{
 		Port: "0", DataDir: dir, FrontendDir: "", DefaultTimezone: "UTC",
 		MaxConcurrency: 2, DailyCallsPerUser: 40,
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	store := newStore(dir)
 	gw := newGateway(cfg)
@@ -37,7 +48,7 @@ func newTestServer(t *testing.T) *testServer {
 		gw.Close()
 		store.Close()
 	})
-	return &testServer{Server: srv, store: store}
+	return &testServer{Server: srv, store: store, sched: sched}
 }
 
 type client struct {
@@ -98,8 +109,17 @@ func (c *client) do(method, path string, body, out any) int {
 // buildPlan walks the mock intake to a finished plan and returns its ID.
 func (c *client) buildPlan() (sessionID, planID string) {
 	c.t.Helper()
+	return c.buildPlanInZone("UTC")
+}
+
+// buildPlanInZone is buildPlan for a caller that cares which timezone the
+// resulting plan is anchored to. POST /api/session updates the timezone of an
+// already-authenticated user, so the zone has to be supplied here rather than
+// only at first sign-in.
+func (c *client) buildPlanInZone(zone string) (sessionID, planID string) {
+	c.t.Helper()
 	var s map[string]any
-	c.do("POST", "/api/session", map[string]any{"lang": "en", "timezone": "UTC"}, &s)
+	c.do("POST", "/api/session", map[string]any{"lang": "en", "timezone": zone}, &s)
 	sessionID, _ = s["sessionId"].(string)
 
 	script := []string{"I want IELTS 7.0", "Academic", "band 5.5", "band 7.0",

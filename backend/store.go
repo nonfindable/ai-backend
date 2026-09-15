@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -26,6 +27,31 @@ import (
 //     synchronously inside every request made a single insert take seconds once
 //     the file reached a few megabytes, and a crash mid-write truncated
 //     everything.
+//
+// # WHAT THIS IS NOT SAFE FOR
+//
+// This store is SINGLE-INSTANCE ONLY. It is correct under concurrent goroutines
+// inside one process and nothing more. Running two replicas against the same
+// DATA_DIR corrupts data; running them against different directories silently
+// splits the user base in two. Specifically:
+//
+//   - No cross-process locking. Two processes sharing a DATA_DIR both hold the
+//     whole dataset in memory and both rename their own full snapshot over the
+//     file, so the last writer wins and the other's writes are simply gone.
+//   - The per-plan mutation locks (keyedMutex, see Scheduler.planLocks) are
+//     in-process mutexes. They order writers inside ONE binary and provide no
+//     mutual exclusion between replicas.
+//   - Bearer tokens live in this map, so a second instance cannot authenticate
+//     a user created by the first.
+//   - The whole dataset is held in memory and rewritten in full on every flush;
+//     cost is O(total data) per write, which bounds it to demo-scale volumes.
+//   - DATA_DIR must be durable. On an ephemeral filesystem (a container without
+//     a mounted disk) every restart loses all users, tokens, plans and the AI
+//     gateway's spend counters, which silently resets the monthly cost cap.
+//
+// Horizontal scaling requires replacing this layer (Postgres, and a shared lock
+// or transactional writes for the plan mutation boundary). Until then, deploy
+// exactly one instance with a persistent volume.
 type Store struct {
 	mu       sync.RWMutex
 	dir      string
@@ -42,6 +68,11 @@ type Store struct {
 	closeOne sync.Once
 	wg       sync.WaitGroup
 	debounce time.Duration
+
+	// snapshotsOff is set when the on-disk snapshot exists but could not be
+	// read. It is written once during load(), before the snapshot goroutine
+	// starts, and only read afterwards.
+	snapshotsOff bool
 }
 
 type persistShape struct {
@@ -85,9 +116,17 @@ func hashToken(tok string) string {
 func (s *Store) load() {
 	data, err := os.ReadFile(s.path())
 	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("store: cannot read %s: %v", s.path(), err)
+		if os.IsNotExist(err) {
+			return // first run
 		}
+		// The file is there but unreadable (permissions, a bad disk). Starting
+		// empty and letting the next snapshot overwrite it would destroy the
+		// only copy, so refuse to write at all until an operator intervenes.
+		// The corrupt-JSON path below can quarantine the file because it can
+		// read it; this path cannot, so it must not touch it.
+		log.Printf("store: cannot read %s: %v — snapshots DISABLED to protect the existing file; "+
+			"state changes will be lost on restart until this is resolved", s.path(), err)
+		s.snapshotsOff = true
 		return
 	}
 	var p persistShape
@@ -154,6 +193,9 @@ func (s *Store) snapshotLoop() {
 }
 
 func (s *Store) writeSnapshot() {
+	if s.snapshotsOff {
+		return
+	}
 	s.mu.RLock()
 	p := persistShape{s.Users, s.Tokens, s.Sessions, s.Goals, s.Plans, s.Events, s.Progress}
 	data, err := json.MarshalIndent(p, "", "  ")
@@ -244,6 +286,33 @@ func (s *Store) UserByToken(token string) (*User, bool) {
 	}
 	u, ok := s.Users[id]
 	return u.clone(), ok
+}
+
+// UpdateUserAvailability merges the availability learned while building a plan
+// into the profile, atomically. Callers used to do GetUser -> mutate the clone
+// -> SaveUser, which is a read-modify-write over a shared record with no lock
+// held between the halves: a concurrent session update or a second plan could
+// silently drop one of the two writes.
+func (s *Store) UpdateUserAvailability(userID string, hoursPerWeek int, days []string) {
+	s.mu.Lock()
+	u, ok := s.Users[userID]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	changed := false
+	if hoursPerWeek > 0 && u.HoursPerWeek != hoursPerWeek {
+		u.HoursPerWeek = hoursPerWeek
+		changed = true
+	}
+	if len(days) > 0 && strings.Join(u.Days, ",") != strings.Join(days, ",") {
+		u.Days = append([]string(nil), days...)
+		changed = true
+	}
+	s.mu.Unlock()
+	if changed {
+		s.markDirty()
+	}
 }
 
 func (s *Store) UserIDs() []string {

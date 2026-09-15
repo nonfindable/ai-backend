@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -17,9 +19,32 @@ import (
 // phase's week window (rehearsal work does not start in week one).
 type Scheduler struct {
 	store *Store
+
+	// planLocks is THE mutation boundary for a plan and its calendar. Every
+	// writer — the schedule, confirm and complete handlers, the rollover
+	// endpoint and the nightly sweep — serialises on it. It used to be split
+	// across a per-plan lock in the API and a per-user lock for rollover, which
+	// are different mutexes and therefore excluded nothing: a rollover holding a
+	// stale event list could write it back after a reschedule had replaced it,
+	// resurrecting every deleted event.
+	//
+	// The API shares this instance (see newAPI) rather than making its own.
+	// Lock order, where both are taken, is always user then plan.
+	planLocks *keyedMutex
 }
 
-func newScheduler(store *Store) *Scheduler { return &Scheduler{store: store} }
+func newScheduler(store *Store) *Scheduler {
+	return &Scheduler{store: store, planLocks: newKeyedMutex()}
+}
+
+// eventID derives a calendar event's identity from the session it represents
+// rather than from a random draw. Two runs of the scheduler over the same plan
+// therefore produce the same IDs, which makes rescheduling idempotent and lets
+// the store reject a duplicate instead of storing it twice under two names.
+func eventID(planID, todoID string, occurrence int) string {
+	sum := sha256.Sum256([]byte(planID + "\x00" + todoID + "\x00" + itoa(occurrence)))
+	return "evt_" + hex.EncodeToString(sum[:8])
+}
 
 const (
 	// maxSessionsPerDay only stops a day being fragmented into many tiny
@@ -96,12 +121,18 @@ type demand struct {
 	week     int // earliest week it may land in (0-based)
 	maxWeek  int // last week of its phase window
 	seq      int // occurrence index within the week, for round-robin fairness
+	occ      int // occurrence index within the todo's whole series, for eventID
 	duration int
 	priority int
 }
 
 // Schedule places every outstanding session of a plan's todos and returns the
 // full event set, preserving sessions that are already done or skipped.
+//
+// The caller MUST hold sc.planLocks for plan.ID across the read-modify-write it
+// performs (load plan + events, Schedule, store the result). Schedule does not
+// take the lock itself because its callers need the whole sequence to be
+// atomic, and keyedMutex is not reentrant.
 func (sc *Scheduler) Schedule(plan *Plan, existing []*CalendarEvent) []*CalendarEvent {
 	loc := loadLocation(plan.Timezone)
 	dayset := parseWeekdaySet(plan.Days)
@@ -128,12 +159,14 @@ func (sc *Scheduler) Schedule(plan *Plan, existing []*CalendarEvent) []*Calendar
 	var kept []*CalendarEvent
 	slots := map[string]*daySlot{}
 	completed := map[string]int{}
+	keptIDs := map[string]bool{}
 	for _, ev := range existing {
 		if ev.Status != "done" && ev.Status != "skipped" {
 			continue
 		}
 		k := ev.clone()
 		kept = append(kept, k)
+		keptIDs[k.ID] = true
 		if k.Status == "done" {
 			completed[k.TodoID]++
 		}
@@ -162,21 +195,32 @@ func (sc *Scheduler) Schedule(plan *Plan, existing []*CalendarEvent) []*Calendar
 		}
 		var own []demand
 		if t.Frequency == "once" {
-			own = append(own, demand{todoIdx: i, week: w0, maxWeek: w1, seq: 0, duration: dur, priority: priorityRank(t.Priority)})
+			own = append(own, demand{todoIdx: i, week: w0, maxWeek: w1, seq: 0, occ: 0, duration: dur, priority: priorityRank(t.Priority)})
 		} else {
 			per := cadencePerWeek(t.Frequency, availableDayCount)
 			for w := w0; w <= w1; w++ {
 				for k := 0; k < per; k++ {
-					own = append(own, demand{todoIdx: i, week: w, maxWeek: w1, seq: k, duration: dur, priority: priorityRank(t.Priority)})
+					own = append(own, demand{todoIdx: i, week: w, maxWeek: w1, seq: k, occ: len(own), duration: dur, priority: priorityRank(t.Priority)})
 				}
 			}
 		}
 		t.PlannedCount = len(own)
 		t.CompletedCount = minInt(completed[t.ID], len(own))
-		// Sessions already completed come off the front of the series.
-		if t.CompletedCount > 0 {
-			own = own[minInt(t.CompletedCount, len(own)):]
+
+		// Drop the occurrences a finished event already covers, matching on the
+		// event's derived identity rather than on how many are done. Slicing the
+		// first CompletedCount off the front assumed completions arrive in order,
+		// so completing a later session by eventId regenerated an occurrence that
+		// a kept "done" event still owned — two events, one ID.
+		outstanding := own[:0]
+		for _, d := range own {
+			if keptIDs[eventID(plan.ID, t.ID, d.occ)] {
+				continue
+			}
+			outstanding = append(outstanding, d)
 		}
+		own = outstanding
+
 		syncTodoStatus(t)
 		demands = append(demands, own...)
 	}
@@ -230,7 +274,7 @@ func (sc *Scheduler) Schedule(plan *Plan, existing []*CalendarEvent) []*Calendar
 					continue
 				}
 				events = append(events, &CalendarEvent{
-					ID:           newID("evt"),
+					ID:           eventID(plan.ID, t.ID, dm.occ),
 					UserID:       plan.UserID,
 					PlanID:       plan.ID,
 					TodoID:       t.ID,
@@ -411,13 +455,32 @@ type RolloverSummary struct {
 // day and recomputes the finish date — the plan "procrastinates" with the user.
 func (sc *Scheduler) Rollover(userID string, ref time.Time) []RolloverSummary {
 	summaries := []RolloverSummary{}
+	// PlansByUser is only used to enumerate IDs; each plan is re-read inside its
+	// own lock, because this snapshot is stale the moment it is returned.
+	for _, p := range sc.store.PlansByUser(userID) {
+		if sum, ok := sc.rolloverPlan(p.ID, userID, ref); ok {
+			summaries = append(summaries, sum)
+		}
+	}
+	return summaries
+}
 
-	for _, plan := range sc.store.PlansByUser(userID) {
+// rolloverPlan rolls one plan forward while holding that plan's mutation lock,
+// so it cannot interleave with a reschedule, a confirm or a completion.
+func (sc *Scheduler) rolloverPlan(planID, userID string, ref time.Time) (RolloverSummary, bool) {
+	unlock := sc.planLocks.Lock(planID)
+	defer unlock()
+
+	plan, ok := sc.store.GetPlan(planID)
+	if !ok || plan.UserID != userID {
+		return RolloverSummary{}, false
+	}
+	{
 		loc := loadLocation(plan.Timezone)
 		refStr := dateStr(ref)
 		events := sc.store.EventsForPlan(plan.ID)
 		if len(events) == 0 {
-			continue
+			return RolloverSummary{}, false
 		}
 
 		dayset := parseWeekdaySet(plan.Days)
@@ -442,7 +505,7 @@ func (sc *Scheduler) Rollover(userID string, ref time.Time) []RolloverSummary {
 			}
 		}
 		if len(missed) == 0 {
-			continue
+			return RolloverSummary{}, false
 		}
 
 		oldFinish := plan.FinishDate
@@ -514,14 +577,13 @@ func (sc *Scheduler) Rollover(userID string, ref time.Time) []RolloverSummary {
 		if plan.MissesDeadline {
 			msg += " " + plan.DeadlineNote
 		}
-		summaries = append(summaries, RolloverSummary{
+		return RolloverSummary{
 			PlanID: plan.ID, Moved: len(missed), OldFinish: oldFinish,
 			NewFinish: newFinish, FinishShifts: shift,
 			MissesDeadline: plan.MissesDeadline, DeadlineNote: plan.DeadlineNote,
 			Message: msg,
-		})
+		}, true
 	}
-	return summaries
 }
 
 // shiftMilestones moves not-yet-reached milestones forward by days.

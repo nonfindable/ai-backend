@@ -1,7 +1,17 @@
+# Secrets — never commit. .env.example is the committed template.
 .env
-/data/
+.env.*
+!.env.example
+
+# Runtime state written by the store and the AI gateway.
+data/
+*.log
+
+# Build output.
 startai
 startai.exe
+app
+app.exe
 *.exe
 *.out
 *.test

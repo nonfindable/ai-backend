@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -67,13 +68,53 @@ type planAI struct {
 }
 
 // Turn is one assistant response to the client.
+//
+// Stage is the authoritative state; a frontend must switch on it rather than
+// parsing Assistant. The stages are:
+//
+//	scope_check     the goal has not been accepted yet (also the opening state)
+//	out_of_scope    the message was not a learning goal; Assistant is the redirect
+//	disambiguation  one narrowing question, with Options as quick replies
+//	intake          an adaptive interview question, with Progress populated
+//	plan_ready      PlanID is set and Done is true; fetch GET /api/plan/{id}
+//
+// Assistant is the full prose for the chat bubble and may carry a lead-in or a
+// skill primer. Question is the bare question for stages that ask one, so a
+// client can render it in a dedicated control without splitting strings.
 type Turn struct {
-	SessionID string   `json:"sessionId"`
-	Stage     string   `json:"stage"`
-	Assistant string   `json:"assistant"`
-	Options   []string `json:"options"`
-	PlanID    string   `json:"planId,omitempty"`
-	Done      bool     `json:"done"`
+	SessionID string    `json:"sessionId"`
+	Stage     string    `json:"stage"`
+	Assistant string    `json:"assistant"`
+	Question  string    `json:"question,omitempty"`
+	Options   []string  `json:"options"`
+	Progress  *Progress `json:"progress,omitempty"`
+	PlanID    string    `json:"planId,omitempty"`
+	Done      bool      `json:"done"`
+}
+
+// Progress describes how far the intake interview has got. The interview is
+// adaptive and normally stops early, so Max is a ceiling the backend guarantees
+// it will not exceed, NOT a promise of how many questions will be asked.
+// Adaptive is always true and exists so a client cannot mistake Max for a total.
+type Progress struct {
+	Answered int  `json:"answered"`
+	Max      int  `json:"max"`
+	Adaptive bool `json:"adaptive"`
+}
+
+// intakeTurn builds an intake Turn with the contract fields filled in.
+func (p *Pipeline) intakeTurn(sess *IntakeSession, assistant, question string, options []string) Turn {
+	return Turn{
+		Stage:     "intake",
+		Assistant: assistant,
+		Question:  question,
+		Options:   options,
+		Progress: &Progress{
+			Answered: clamp(sess.AskedCount, 0, maxIntakeQuestions),
+			Max:      maxIntakeQuestions,
+			Adaptive: true,
+		},
+	}
 }
 
 type Pipeline struct {
@@ -137,8 +178,11 @@ func (p *Pipeline) doUnderstand(ctx context.Context, sess *IntakeSession, msg st
 		if err != nil {
 			return Turn{}, err
 		}
+		// A malformed live response is a live failure. Quietly substituting the
+		// mock brain here made a broken model indistinguishable from a working
+		// one, in production as well as in demos.
 		if e := json.Unmarshal([]byte(raw), &u); e != nil {
-			u = mockUnderstand(msg, sess.Lang) // graceful fallback on a malformed response
+			return Turn{}, fmt.Errorf("%w: understand stage returned unparsable JSON: %v", errAIUnavailable, e)
 		}
 	} else {
 		u = mockUnderstand(msg, sess.Lang)
@@ -169,11 +213,14 @@ func (p *Pipeline) doUnderstand(ctx context.Context, sess *IntakeSession, msg st
 	if u.NeedsDisambiguation {
 		sess.NeedsDisambiguation = true
 		sess.Stage = "disambiguation"
-		return Turn{Stage: sess.Stage, Assistant: u.DisambiguationQuestion, Options: u.Options}, nil
+		return Turn{Stage: sess.Stage, Assistant: u.DisambiguationQuestion, Question: u.DisambiguationQuestion, Options: u.Options}, nil
 	}
 
 	sess.Stage = "intake"
-	first := p.firstIntakeTurn(ctx, sess)
+	first, err := p.firstIntakeTurn(ctx, sess)
+	if err != nil {
+		return Turn{}, err
+	}
 	intro := strings.TrimSpace(u.Overview)
 	if intro != "" {
 		first.Assistant = intro + "\n\n" + first.Assistant
@@ -185,32 +232,39 @@ func (p *Pipeline) doDisambiguation(ctx context.Context, sess *IntakeSession, ms
 	sess.Path = sanitizeSkillLabel(msg)
 	sess.NeedsDisambiguation = false
 	sess.Stage = "intake"
-	return p.firstIntakeTurn(ctx, sess), nil
+	return p.firstIntakeTurn(ctx, sess)
 }
 
-func (p *Pipeline) firstIntakeTurn(ctx context.Context, sess *IntakeSession) Turn {
-	r := p.nextIntake(ctx, sess, "")
+func (p *Pipeline) firstIntakeTurn(ctx context.Context, sess *IntakeSession) (Turn, error) {
+	r, err := p.nextIntake(ctx, sess, "")
+	if err != nil {
+		return Turn{}, err
+	}
 	lead := tr(sess.Lang,
 		"Let's tailor your plan for "+sess.Skill+". ",
 		"Давайте настроим ваш план для «"+sess.Skill+"». ",
 		"Keling, «"+sess.Skill+"» uchun rejangizni moslaymiz. ")
-	return Turn{Stage: "intake", Assistant: lead + r.NextQuestion, Options: r.Options}
+	return p.intakeTurn(sess, lead+r.NextQuestion, r.NextQuestion, r.Options), nil
 }
 
 func (p *Pipeline) doIntake(ctx context.Context, sess *IntakeSession, msg string) (Turn, error) {
 	sess.AskedCount++
-	r := p.nextIntake(ctx, sess, msg)
+	r, err := p.nextIntake(ctx, sess, msg)
+	if err != nil {
+		return Turn{}, err
+	}
 
 	if r.Done || sess.AskedCount >= maxIntakeQuestions {
 		return p.finishIntakeAndPlan(ctx, sess)
 	}
-	return Turn{Stage: "intake", Assistant: r.NextQuestion, Options: r.Options}, nil
+	return p.intakeTurn(sess, r.NextQuestion, r.NextQuestion, r.Options), nil
 }
 
-// nextIntake runs one adaptive intake step, real or mock.
-func (p *Pipeline) nextIntake(ctx context.Context, sess *IntakeSession, latest string) intakeResult {
+// nextIntake runs one adaptive intake step, real or mock. In live mode every
+// failure is reported: it never falls through to the mock brain.
+func (p *Pipeline) nextIntake(ctx context.Context, sess *IntakeSession, latest string) (intakeResult, error) {
 	if !p.gw.Enabled() {
-		return mockIntake(sess, latest)
+		return mockIntake(sess, latest), nil
 	}
 	// Build a compact context of skill + answers + latest reply.
 	ctxObj := map[string]any{
@@ -223,19 +277,20 @@ func (p *Pipeline) nextIntake(ctx context.Context, sess *IntakeSession, latest s
 	b, _ := json.Marshal(ctxObj)
 	raw, err := p.gw.Chat(ctx, sess.UserID, p.cfg.ModelFast, withLang(prompts["intake"].System, sess.Lang), string(b), true, cacheKeyFor("intake", sess.Lang, string(b)))
 	if err != nil {
-		return mockIntake(sess, latest)
+		return intakeResult{}, err
 	}
 	var r intakeResult
-	if json.Unmarshal([]byte(raw), &r) != nil {
-		return mockIntake(sess, latest)
+	if e := json.Unmarshal([]byte(raw), &r); e != nil {
+		return intakeResult{}, fmt.Errorf("%w: intake stage returned unparsable JSON: %v", errAIUnavailable, e)
 	}
 	applyAnswers(sess, r.Answers)
 	// A model that neither finishes nor asks anything would leave the user
-	// staring at an empty bubble; fall back to the deterministic question set.
+	// staring at an empty bubble. That is a live failure to surface, not a cue
+	// to silently hand the conversation to the mock question set.
 	if !r.Done && strings.TrimSpace(r.NextQuestion) == "" {
-		return mockIntake(sess, latest)
+		return intakeResult{}, fmt.Errorf("%w: intake stage returned neither a question nor done", errAIUnavailable)
 	}
-	return r
+	return r, nil
 }
 
 func applyAnswers(sess *IntakeSession, m map[string]string) {
@@ -256,12 +311,10 @@ func applyAnswers(sess *IntakeSession, m map[string]string) {
 	set(&a.Motivation, "motivation")
 	set(&a.PivotalChoice, "pivotalChoice")
 	if v := strings.TrimSpace(m["deadline"]); v != "" {
-		if _, ok := parseDate(v); ok {
+		if validDate(v) {
 			a.Deadline = v
-		} else if d := reISODate.FindString(v); d != "" {
-			if _, ok := parseDate(d); ok {
-				a.Deadline = d
-			}
+		} else if d := reISODate.FindString(v); d != "" && validDate(d) {
+			a.Deadline = d
 		}
 	}
 	if v := strings.TrimSpace(m["hoursPerWeek"]); v != "" {
@@ -277,25 +330,17 @@ func applyAnswers(sess *IntakeSession, m map[string]string) {
 }
 
 func (p *Pipeline) finishIntakeAndPlan(ctx context.Context, sess *IntakeSession) (Turn, error) {
-	plan := p.buildPlan(ctx, sess)
+	plan, err := p.buildPlan(ctx, sess)
+	if err != nil {
+		return Turn{}, err
+	}
 	p.store.SavePlan(plan)
 	sess.PlanID = plan.ID
 	sess.Stage = "plan_ready"
 
 	// Remember the availability on the profile so a second goal does not have
 	// to ask for it again.
-	if u, ok := p.store.GetUser(sess.UserID); ok {
-		changed := false
-		if plan.HoursPerWeek > 0 && u.HoursPerWeek != plan.HoursPerWeek {
-			u.HoursPerWeek, changed = plan.HoursPerWeek, true
-		}
-		if len(plan.Days) > 0 && strings.Join(u.Days, ",") != strings.Join(plan.Days, ",") {
-			u.Days, changed = append([]string(nil), plan.Days...), true
-		}
-		if changed {
-			p.store.SaveUser(u)
-		}
-	}
+	p.store.UpdateUserAvailability(sess.UserID, plan.HoursPerWeek, plan.Days)
 
 	msg := tr(sess.Lang,
 		"All set — I built your plan for "+plan.Skill+". "+plan.Assessment+"\n\nOpen the plan on the right, then hit “Schedule it” to lay it on your calendar.",
@@ -305,7 +350,9 @@ func (p *Pipeline) finishIntakeAndPlan(ctx context.Context, sess *IntakeSession)
 }
 
 // buildPlan produces the plan (real AI or mock) and materializes it into models.
-func (p *Pipeline) buildPlan(ctx context.Context, sess *IntakeSession) *Plan {
+// In live mode a failure is returned, never papered over with a mock plan: a
+// user must not be handed canned content believing the model produced it.
+func (p *Pipeline) buildPlan(ctx context.Context, sess *IntakeSession) (*Plan, error) {
 	tz := ""
 	if u, ok := p.store.GetUser(sess.UserID); ok {
 		tz = u.Timezone
@@ -317,13 +364,19 @@ func (p *Pipeline) buildPlan(ctx context.Context, sess *IntakeSession) *Plan {
 		ctxObj := map[string]any{"skill": sess.Skill, "path": sess.Path, "answers": sess.Answers}
 		b, _ := json.Marshal(ctxObj)
 		raw, err := p.gw.Chat(ctx, sess.UserID, p.cfg.ModelSmart, withLang(prompts["plan"].System, sess.Lang), string(b), true, cacheKeyFor("plan", sess.Lang, string(b)))
-		if err != nil || json.Unmarshal([]byte(raw), &pa) != nil || len(pa.Todos) == 0 {
-			pa = mockPlan(sess, loc)
+		if err != nil {
+			return nil, err
+		}
+		if e := json.Unmarshal([]byte(raw), &pa); e != nil {
+			return nil, fmt.Errorf("%w: plan stage returned unparsable JSON: %v", errAIUnavailable, e)
+		}
+		if len(pa.Todos) == 0 {
+			return nil, fmt.Errorf("%w: plan stage returned no todos", errAIUnavailable)
 		}
 	} else {
 		pa = mockPlan(sess, loc)
 	}
-	return materializePlan(sess, pa, tz)
+	return materializePlan(sess, pa, tz), nil
 }
 
 // materializePlan turns the AI/mock plan shape into the stored domain model,

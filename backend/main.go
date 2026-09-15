@@ -46,7 +46,10 @@ func main() {
 				return
 			case <-ticker.C:
 				for _, id := range store.UserIDs() {
-					loc := time.Local
+					// "Today" is decided in the learner's zone, with the
+					// configured default standing in only if the user record
+					// has gone missing — never the host machine's zone.
+					loc := loadLocation(cfg.DefaultTimezone)
 					if u, ok := store.GetUser(id); ok {
 						loc = loadLocation(u.Timezone)
 					}

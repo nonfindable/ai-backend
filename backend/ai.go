@@ -132,17 +132,18 @@ type oaResp struct {
 type callClass int
 
 const (
-	classOK        callClass = iota
-	classRetry               // transient: retry the same model
-	classPermanent           // this model won't work: try the fallback model
-	classFatal               // auth/config problem: no model will work
+	classOK          callClass = iota
+	classRetry                 // transient: retry the same model
+	classRateLimited           // throttled or out of capacity: retry, then report as such
+	classPermanent             // this model won't work: try the fallback model
+	classFatal                 // auth/config problem: no model will work
 )
 
 // Chat runs one completion through all the gateway protections and returns the
 // assistant text. cacheKey (when non-empty) enables caching for repeatable calls.
 func (g *Gateway) Chat(ctx context.Context, userID, model, system, user string, jsonMode bool, cacheKey string) (string, error) {
 	if !g.Enabled() {
-		return "", errors.New("gateway disabled (set AI_LIVE=true and OPENAI_API_KEY)")
+		return "", fmt.Errorf("%w: set AI_LIVE=true and OPENAI_API_KEY", errGatewayDisabled)
 	}
 
 	// 1) cache — the most-repeated calls (skill overviews, question templates)
@@ -162,7 +163,7 @@ func (g *Gateway) Chat(ctx context.Context, userID, model, system, user string, 
 	over := g.cfg.MonthlyUSDCap > 0 && g.costUSD >= g.cfg.MonthlyUSDCap
 	g.meterMu.Unlock()
 	if over {
-		return "", errors.New("monthly AI spend cap reached")
+		return "", fmt.Errorf("%w (cap $%.2f)", errSpendCapReached, g.cfg.MonthlyUSDCap)
 	}
 
 	// 3) concurrency cap (backpressure).
@@ -186,10 +187,12 @@ func (g *Gateway) Chat(ctx context.Context, userID, model, system, user string, 
 		models = append(models, g.cfg.ModelFast)
 	}
 	var lastErr error
+	lastClass := classPermanent
 	for _, m := range models {
 		fatal := false
 		for attempt := 0; attempt < 3; attempt++ {
 			out, class, err := g.callOnce(ctx, m, system, user, jsonMode)
+			lastClass = class
 			if err == nil && class == classOK {
 				if cacheKey != "" {
 					g.cachePut(cacheKey, out)
@@ -203,7 +206,7 @@ func (g *Gateway) Chat(ctx context.Context, userID, model, system, user string, 
 				fatal = true
 				break
 			}
-			if class != classRetry {
+			if class != classRetry && class != classRateLimited {
 				break
 			}
 			select {
@@ -219,7 +222,16 @@ func (g *Gateway) Chat(ctx context.Context, userID, model, system, user string, 
 	}
 	// Nothing was delivered, so do not hold the user's quota against them.
 	g.refundQuota(userID)
-	return "", fmt.Errorf("ai call failed: %w", lastErr)
+
+	// The provider's own words stay in the log only. The returned error carries
+	// a sentinel so the API can pick a stable code, plus the detail for the
+	// server-side log line — callers must never render it.
+	sentinel := errAIUnavailable
+	if lastClass == classRateLimited {
+		sentinel = errAIRateLimited
+	}
+	log.Printf("gateway: all attempts failed (model=%s): %v", model, lastErr)
+	return "", fmt.Errorf("%w: %v", sentinel, lastErr)
 }
 
 func (g *Gateway) cacheGet(key string) (string, bool) {
@@ -266,7 +278,7 @@ func (g *Gateway) claimQuota(userID string) error {
 		return nil
 	}
 	if g.dailyUse[userID] >= g.cfg.DailyCallsPerUser {
-		return fmt.Errorf("daily AI quota reached (%d calls)", g.cfg.DailyCallsPerUser)
+		return fmt.Errorf("%w (%d calls)", errDailyQuota, g.cfg.DailyCallsPerUser)
 	}
 	g.dailyUse[userID]++
 	g.markDirty()
@@ -319,7 +331,9 @@ func (g *Gateway) callOnce(ctx context.Context, model, system, user string, json
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
 		return "", classFatal, fmt.Errorf("openai status %d: %s", resp.StatusCode, string(body))
-	case resp.StatusCode == http.StatusTooManyRequests, resp.StatusCode >= 500:
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return "", classRateLimited, fmt.Errorf("openai status %d: %s", resp.StatusCode, string(body))
+	case resp.StatusCode >= 500:
 		return "", classRetry, fmt.Errorf("openai status %d: %s", resp.StatusCode, string(body))
 	case resp.StatusCode != http.StatusOK:
 		return "", classPermanent, fmt.Errorf("openai status %d: %s", resp.StatusCode, string(body))
@@ -410,7 +424,12 @@ func (g *Gateway) loadState() {
 	}
 	g.tokensIn, g.tokensOut = st.TokensIn, st.TokensOut
 	g.costUSD, g.callsTotal, g.callsCache = st.CostUSD, st.CallsTotal, st.CallsCache
+	// rollPeriodsLocked documents that the caller holds g.mu. It is true that
+	// nothing else runs yet during construction, but honouring the contract
+	// costs nothing and stops the next caller inheriting a latent race.
+	g.mu.Lock()
 	g.rollPeriodsLocked(time.Now())
+	g.mu.Unlock()
 }
 
 func (g *Gateway) markDirty() {

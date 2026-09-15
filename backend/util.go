@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -36,17 +37,30 @@ func randomHex(n int) string {
 
 // ---- dates ----
 //
-// Everything in this app is calendar-day arithmetic in the *user's* timezone.
-// parseDate and todayIn therefore always agree on a location; mixing a UTC
-// parse with a local "today" silently shifts every duration by the UTC offset.
+// THE DATE MODEL
+//
+// A plan's StartDate, FinishDate, a milestone's TargetDate and an event's Date
+// are "floating" local dates in YYYY-MM-DD, and StartTime is a local wall-clock
+// HH:MM. The timezone they belong to is ALWAYS the plan's own Plan.Timezone
+// (seeded from User.Timezone), never the server's and never the browser's.
+//
+// That means:
+//   - 18:00 on 2026-10-01 means 18:00 where the learner is, on both devices
+//   - the only place these become absolute instants is the .ics export, which
+//     resolves them against Plan.Timezone and emits UTC
+//   - a client must send its IANA zone to POST /api/session and then render
+//     these strings as-is; re-interpreting them in the browser's zone shifts
+//     sessions by the offset
+//
+// Every helper below therefore takes an explicit *time.Location. There is
+// deliberately no server-local convenience wrapper: one of those silently bound
+// deadline parsing to whatever zone the host happened to run in.
 
 // todayIn returns midnight of the current day in loc.
 func todayIn(loc *time.Location) time.Time {
 	n := time.Now().In(loc)
 	return time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, loc)
 }
-
-func today() time.Time { return todayIn(time.Local) }
 
 func dateStr(t time.Time) string { return t.Format(dateLayout) }
 
@@ -59,7 +73,13 @@ func parseDateIn(s string, loc *time.Location) (time.Time, bool) {
 	return t, true
 }
 
-func parseDate(s string) (time.Time, bool) { return parseDateIn(s, time.Local) }
+// validDate reports whether s is a well-formed YYYY-MM-DD calendar date. It is
+// pure format validation and deliberately zone-free: which day "2026-12-01"
+// refers to is decided later, by the plan's timezone.
+func validDate(s string) bool {
+	_, err := time.Parse(dateLayout, strings.TrimSpace(s))
+	return err == nil
+}
 
 // daysBetween counts calendar days from -> to, immune to DST transitions
 // because it compares dates rather than instants.
@@ -69,17 +89,41 @@ func daysBetween(from, to time.Time) int {
 	return int(b.Sub(a).Hours() / 24)
 }
 
-// loadLocation resolves an IANA timezone name, falling back to the server's
-// local zone. time/tzdata is embedded (see main.go) so this works without the
-// host having a zoneinfo database.
+// loadLocation resolves an IANA timezone name. time/tzdata is embedded (see
+// main.go) so this works without the host having a zoneinfo database.
+//
+// An unresolvable name falls back to UTC, not to the server's local zone, and
+// says so in the log. Falling back to time.Local meant a typo'd or missing
+// timezone silently scheduled a learner's sessions in whatever zone the host
+// machine ran in — a value that differs between a laptop and a container and
+// is invisible in the API response.
 func loadLocation(name string) *time.Location {
-	if strings.TrimSpace(name) == "" {
-		return time.Local
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return time.UTC
 	}
 	if loc, err := time.LoadLocation(name); err == nil {
 		return loc
 	}
-	return time.Local
+	log.Printf("time: unknown timezone %q; falling back to UTC", name)
+	return time.UTC
+}
+
+// resolveTimezone validates an IANA name, returning the fallback when it is
+// blank or unknown. Callers store the returned name, so a User and a Plan
+// always carry a timezone that actually resolves.
+func resolveTimezone(name, fallback string) string {
+	if n := strings.TrimSpace(name); n != "" {
+		if _, err := time.LoadLocation(n); err == nil {
+			return n
+		}
+	}
+	if f := strings.TrimSpace(fallback); f != "" {
+		if _, err := time.LoadLocation(f); err == nil {
+			return f
+		}
+	}
+	return "UTC"
 }
 
 // ---- numbers & strings ----

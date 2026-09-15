@@ -320,7 +320,7 @@ func ingestAnswer(sess *IntakeSession, latest string) {
 	if a.Deadline == "" && sess.AnswerBag["deadline_asked"] != "yes" {
 		sess.AnswerBag["deadline_asked"] = "yes"
 		if d := reISODate.FindString(latest); d != "" {
-			if _, ok := parseDate(d); ok {
+			if validDate(d) {
 				a.Deadline = d
 			}
 		}

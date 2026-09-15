@@ -20,6 +20,12 @@ type API struct {
 	// Conversations and plans are each mutated by more than one endpoint. These
 	// serialize work per entity, so a turn or a reschedule is atomic without
 	// holding the store's global lock across an AI call.
+	//
+	// planLocks is NOT created here: it is shared with the Scheduler, so the
+	// rollover endpoint and the nightly sweep contend on the same mutex as the
+	// schedule/confirm/complete handlers. Two separate mutexes excluded nothing
+	// and let a stale rollover write resurrect events a reschedule had deleted.
+	// Lock order where both are taken: userLocks then planLocks.
 	sessionLocks *keyedMutex
 	planLocks    *keyedMutex
 	userLocks    *keyedMutex
@@ -29,7 +35,7 @@ func newAPI(cfg Config, store *Store, gw *Gateway, pipe *Pipeline, sched *Schedu
 	return &API{
 		cfg: cfg, store: store, gw: gw, pipe: pipe, sched: sched,
 		sessionLocks: newKeyedMutex(),
-		planLocks:    newKeyedMutex(),
+		planLocks:    sched.planLocks, // shared: see the field comment
 		userLocks:    newKeyedMutex(),
 	}
 }
@@ -106,7 +112,7 @@ func (a *API) requireUser(next func(http.ResponseWriter, *http.Request, *User)) 
 		user, err := a.authenticate(r)
 		if err != nil {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="start.ai"`)
-			writeErr(w, http.StatusUnauthorized, "authentication required: send the token from POST /api/session as 'Authorization: Bearer <token>'")
+			writeAPIError(w, http.StatusUnauthorized, codeUnauthorized)
 			return
 		}
 		next(w, r, user)
@@ -171,14 +177,17 @@ func (a *API) handleSession(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		token = newToken()
 		user = &User{
-			ID:        newID("user"),
-			Name:      strings.TrimSpace(req.Name),
-			Timezone:  firstNonEmpty(req.Timezone, a.cfg.DefaultTimezone),
+			ID:   newID("user"),
+			Name: strings.TrimSpace(req.Name),
+			// Resolved, not merely copied: an unknown IANA name stored here
+			// would be silently reinterpreted as the server's zone every time
+			// the scheduler touched this user's plans.
+			Timezone:  resolveTimezone(req.Timezone, a.cfg.DefaultTimezone),
 			CreatedAt: time.Now(),
 		}
 		a.store.SaveUser(user)
 		a.store.SaveToken(token, user.ID)
-	} else if tz := strings.TrimSpace(req.Timezone); tz != "" && tz != user.Timezone {
+	} else if tz := resolveTimezone(req.Timezone, user.Timezone); strings.TrimSpace(req.Timezone) != "" && tz != user.Timezone {
 		user.Timezone = tz
 		a.store.SaveUser(user)
 	}
@@ -215,15 +224,11 @@ type chatReq struct {
 func (a *API) handleChat(w http.ResponseWriter, r *http.Request, user *User) {
 	var req chatReq
 	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, "invalid body")
+		writeAPIError(w, 400, codeInvalidRequest)
 		return
 	}
-	if strings.TrimSpace(req.SessionID) == "" {
-		writeErr(w, 400, "sessionId required")
-		return
-	}
-	if strings.TrimSpace(req.Message) == "" {
-		writeErr(w, 400, "empty message")
+	if strings.TrimSpace(req.SessionID) == "" || strings.TrimSpace(req.Message) == "" {
+		writeAPIError(w, 400, codeInvalidRequest)
 		return
 	}
 
@@ -232,7 +237,7 @@ func (a *API) handleChat(w http.ResponseWriter, r *http.Request, user *User) {
 
 	sess, ok := a.store.GetSession(req.SessionID)
 	if !ok || sess.UserID != user.ID {
-		writeErr(w, 404, "session not found")
+		writeAPIError(w, 404, codeSessionNotFound)
 		return
 	}
 	if req.Lang != "" {
@@ -244,7 +249,11 @@ func (a *API) handleChat(w http.ResponseWriter, r *http.Request, user *User) {
 
 	turn, err := a.pipe.HandleChat(ctx, sess, req.Message)
 	if err != nil {
-		writeErr(w, 502, "ai error: "+err.Error())
+		// The cause is logged under a reference; the client gets a stable code
+		// and a fixed message. Forwarding err.Error() here once leaked the
+		// provider's billing text straight to callers.
+		status, code := classifyAIError(err)
+		writeAPIErrorLogging(w, status, code, "chat", err)
 		return
 	}
 	writeJSON(w, 200, turn)
@@ -253,7 +262,7 @@ func (a *API) handleChat(w http.ResponseWriter, r *http.Request, user *User) {
 func (a *API) handlePlan(w http.ResponseWriter, r *http.Request, user *User) {
 	plan, ok := a.ownedPlan(r.PathValue("id"), user)
 	if !ok {
-		writeErr(w, 404, "plan not found")
+		writeAPIError(w, 404, codePlanNotFound)
 		return
 	}
 	writeJSON(w, 200, plan)
@@ -266,7 +275,7 @@ type planRef struct {
 func (a *API) handleSchedule(w http.ResponseWriter, r *http.Request, user *User) {
 	var req planRef
 	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, "invalid body")
+		writeAPIError(w, 400, codeInvalidRequest)
 		return
 	}
 	unlock := a.planLocks.Lock(req.PlanID)
@@ -274,7 +283,7 @@ func (a *API) handleSchedule(w http.ResponseWriter, r *http.Request, user *User)
 
 	plan, ok := a.ownedPlan(req.PlanID, user)
 	if !ok {
-		writeErr(w, 404, "plan not found")
+		writeAPIError(w, 404, codePlanNotFound)
 		return
 	}
 	events := a.sched.Schedule(plan, a.store.EventsForPlan(plan.ID))
@@ -292,7 +301,7 @@ func (a *API) handleSchedule(w http.ResponseWriter, r *http.Request, user *User)
 func (a *API) handleConfirm(w http.ResponseWriter, r *http.Request, user *User) {
 	var req planRef
 	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, "invalid body")
+		writeAPIError(w, 400, codeInvalidRequest)
 		return
 	}
 	unlock := a.planLocks.Lock(req.PlanID)
@@ -300,7 +309,7 @@ func (a *API) handleConfirm(w http.ResponseWriter, r *http.Request, user *User) 
 
 	plan, ok := a.ownedPlan(req.PlanID, user)
 	if !ok {
-		writeErr(w, 404, "plan not found")
+		writeAPIError(w, 404, codePlanNotFound)
 		return
 	}
 	events := a.store.EventsForPlan(plan.ID)
@@ -321,7 +330,7 @@ func (a *API) handleConfirm(w http.ResponseWriter, r *http.Request, user *User) 
 func (a *API) handleCalendar(w http.ResponseWriter, r *http.Request, user *User) {
 	if planID := strings.TrimSpace(r.URL.Query().Get("planId")); planID != "" {
 		if _, ok := a.ownedPlan(planID, user); !ok {
-			writeErr(w, 404, "plan not found")
+			writeAPIError(w, 404, codePlanNotFound)
 			return
 		}
 		writeJSON(w, 200, a.store.EventsForPlan(planID))
@@ -339,7 +348,7 @@ type completeReq struct {
 func (a *API) handleComplete(w http.ResponseWriter, r *http.Request, user *User) {
 	var req completeReq
 	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, "invalid body")
+		writeAPIError(w, 400, codeInvalidRequest)
 		return
 	}
 	unlock := a.planLocks.Lock(req.PlanID)
@@ -347,7 +356,7 @@ func (a *API) handleComplete(w http.ResponseWriter, r *http.Request, user *User)
 
 	plan, ok := a.ownedPlan(req.PlanID, user)
 	if !ok {
-		writeErr(w, 404, "plan not found")
+		writeAPIError(w, 404, codePlanNotFound)
 		return
 	}
 
@@ -359,7 +368,7 @@ func (a *API) handleComplete(w http.ResponseWriter, r *http.Request, user *User)
 		}
 	}
 	if idx < 0 {
-		writeErr(w, 404, "todo not found")
+		writeAPIError(w, 404, codeTodoNotFound)
 		return
 	}
 	t := &plan.Todos[idx]
@@ -384,7 +393,7 @@ func (a *API) handleComplete(w http.ResponseWriter, r *http.Request, user *User)
 		break
 	}
 	if req.EventID != "" && target == nil {
-		writeErr(w, 404, "event not found")
+		writeAPIError(w, 404, codeEventNotFound)
 		return
 	}
 	if target != nil {
@@ -435,7 +444,7 @@ func (a *API) handleRollover(w http.ResponseWriter, r *http.Request, user *User)
 func (a *API) handleICS(w http.ResponseWriter, r *http.Request, user *User) {
 	plan, ok := a.ownedPlan(r.PathValue("id"), user)
 	if !ok {
-		writeErr(w, 404, "plan not found")
+		writeAPIError(w, 404, codePlanNotFound)
 		return
 	}
 	events := a.store.EventsForPlan(plan.ID)
@@ -464,10 +473,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("api: response encode failed: %v", err)
 	}
-}
-
-func writeErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
 }
 
 func readJSON(r *http.Request, dst any) error {
