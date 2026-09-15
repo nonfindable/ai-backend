@@ -1,0 +1,7 @@
+.env
+/data/
+startai
+startai.exe
+*.exe
+*.out
+*.test
