@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -83,5 +84,63 @@ func TestMockApprovalNeedsAnUnambiguousYes(t *testing.T) {
 		if approvesPlan(s) {
 			t.Errorf("%q must NOT build a plan", s)
 		}
+	}
+}
+
+// Models disagree about whether a number is a number or a string, and some
+// emit both shapes across runs. Every consumer downstream works on strings, so
+// the decoder coerces rather than trusting the model to quote its own output:
+// an unquoted hoursPerWeek used to fail the whole intake stage with
+// "cannot unmarshal number into Go struct field ... of type string".
+func TestIntakeAnswersAcceptEitherJSONShape(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want map[string]string
+	}{
+		{
+			"numbers and arrays unquoted",
+			`{"answers":{"hoursPerWeek":14,"days":["Mon","Tue","Fri"],"currentLevel":"A1"}}`,
+			map[string]string{"hoursPerWeek": "14", "days": "Mon,Tue,Fri", "currentLevel": "A1"},
+		},
+		{
+			"everything quoted",
+			`{"answers":{"hoursPerWeek":"14","days":"Mon,Tue,Fri","currentLevel":"A1"}}`,
+			map[string]string{"hoursPerWeek": "14", "days": "Mon,Tue,Fri", "currentLevel": "A1"},
+		},
+		{
+			"nulls, objects and floats collapse safely",
+			`{"answers":{"hoursPerWeek":7.5,"deadline":null,"budget":{"per":"month"},"motivation":true}}`,
+			map[string]string{"hoursPerWeek": "7.5", "deadline": "", "budget": "", "motivation": "true"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var r intakeResult
+			if err := json.Unmarshal([]byte(tc.raw), &r); err != nil {
+				t.Fatalf("decode failed: %v", err)
+			}
+			for k, want := range tc.want {
+				if got := r.Answers[k]; got != want {
+					t.Errorf("answers[%q] = %q, want %q", k, got, want)
+				}
+			}
+		})
+	}
+}
+
+// And the coerced values must survive the trip into the session.
+func TestNumericHoursReachTheAnswers(t *testing.T) {
+	var r intakeResult
+	if err := json.Unmarshal([]byte(`{"answers":{"hoursPerWeek":14,"days":["Mon","Tue","Fri"]}}`), &r); err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	sess := &IntakeSession{}
+	applyAnswers(sess, r.Answers)
+	if sess.Answers.HoursPerWeek != 14 {
+		t.Errorf("hoursPerWeek = %d, want 14", sess.Answers.HoursPerWeek)
+	}
+	if strings.Join(sess.Answers.Days, ",") != "Mon,Tue,Fri" {
+		t.Errorf("days = %v, want Mon,Tue,Fri", sess.Answers.Days)
 	}
 }
