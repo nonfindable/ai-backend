@@ -16,6 +16,22 @@ type Config struct {
 	ModelSmart string
 	OpenAIBase string
 
+	// MaxCompletionTokens caps one response. It is sent explicitly because a
+	// provider default that is generous for chat is not generous for a plan:
+	// Groq's default for gpt-oss-120b is 3072, and a reasoning model spends
+	// ~2300 of those thinking, leaving too few for the JSON. The response is
+	// then cut off mid-object and comes back either as unparsable text or as a
+	// 400 json_validate_failed with an empty failed_generation. 0 omits the
+	// field and restores the provider default.
+	MaxCompletionTokens int
+
+	// ReasoningEffort is the "reasoning_effort" parameter that reasoning models
+	// (gpt-oss, o-series) accept. Sending "low" on gpt-oss-120b cut reasoning
+	// from ~2300 tokens to ~220 with no loss of plan quality, which is the
+	// difference between fitting and not fitting in a small TPM allowance.
+	// Empty omits the field — required for models that reject it.
+	ReasoningEffort string
+
 	// AILive is the explicit master switch for live ChatGPT generation.
 	// Live mode requires BOTH this flag and a key, so a key sitting in .env can
 	// be parked without being spent, and "am I live?" is a setting you can read
@@ -115,7 +131,11 @@ func loadConfig() Config {
 		ModelSmart: getenv("OPENAI_MODEL_SMART", "gpt-4o"),
 		OpenAIBase: getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
 		AILive:     getenvBool("AI_LIVE", true),
-		Port:       getenv("PORT", "8080"),
+
+		MaxCompletionTokens: getenvInt("AI_MAX_COMPLETION_TOKENS", 8192),
+		ReasoningEffort:     getenv("AI_REASONING_EFFORT", ""),
+
+		Port: getenv("PORT", "8080"),
 		// Empty by default: the server hosts its own frontend on the same
 		// origin, so no cross-origin grant is needed out of the box.
 		CORSOrigin:          getenv("CORS_ALLOW_ORIGIN", ""),

@@ -31,8 +31,11 @@ func TestFullUserJourney(t *testing.T) {
 	// 2/3. start chat and complete the intake
 	var planID string
 	var lastStage string
+	// The last message is the go-ahead: nothing is built until the user
+	// approves the recap at the confirm_plan stage.
 	script := []string{"I want IELTS 7.0", "Academic", "band 5.5", "band 7.0",
-		"2026-12-01", "10 hours a week on Mon Wed Fri", "free materials"}
+		"2026-12-01", "10 hours a week on Mon Wed Fri", "free materials",
+		"yes, build my plan"}
 	for _, msg := range script {
 		turn := chatTurn(t, c, sessionID, msg)
 		lastStage = turn.Stage

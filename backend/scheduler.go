@@ -52,10 +52,18 @@ const (
 	// derived from the user's stated hours. A hard cap of 2 silently became the
 	// binding constraint and pushed work outside its own phase window.
 	maxSessionsPerDay = 4
-	dayStartMinute    = 18 * 60 // 18:00
-	slotGapMinute     = 15
-	defaultHoursWeek  = 6
-	maxPlanWeeks      = 52
+
+	// The study day runs between these. dayStartMinute is where a normal
+	// evening begins; dayEndMinute is the hour nothing may run past, because a
+	// session pushed to 23:30 is one the learner will not do. When the user's
+	// own weekly commitment cannot fit in that window the day opens earlier,
+	// down to dayFloorMinute — see dayStartFor.
+	dayStartMinute   = 18 * 60 // 18:00
+	dayEndMinute     = 22 * 60 // 22:00
+	dayFloorMinute   = 8 * 60  // 08:00
+	slotGapMinute    = 15
+	defaultHoursWeek = 6
+	maxPlanWeeks     = 52
 
 	// overflowWeeks bounds how far past the plan's nominal end a session may
 	// spill when its own phase window is full or already in the past.
@@ -154,6 +162,7 @@ func (sc *Scheduler) Schedule(plan *Plan, existing []*CalendarEvent) []*Calendar
 	if weeklyBudget <= 0 {
 		weeklyBudget = defaultHoursWeek * 60
 	}
+	dayStart := dayStartFor(weeklyBudget, len(dayset))
 
 	// Keep finished history exactly where it is; only outstanding work moves.
 	var kept []*CalendarEvent
@@ -170,7 +179,7 @@ func (sc *Scheduler) Schedule(plan *Plan, existing []*CalendarEvent) []*Calendar
 		if k.Status == "done" {
 			completed[k.TodoID]++
 		}
-		s := slotFor(slots, k.Date)
+		s := slotFor(slots, k.Date, dayStart)
 		s.count++
 		s.minutes += k.DurationMin
 		if end := startMinuteOf(k.StartTime) + k.DurationMin + slotGapMinute; end > s.nextStart {
@@ -263,14 +272,34 @@ func (sc *Scheduler) Schedule(plan *Plan, existing []*CalendarEvent) []*Calendar
 			if len(dates) == 0 {
 				continue
 			}
-			limit := dayMinuteCap(weeklyBudget, len(dates), dm.duration)
-			for _, d := range dates {
+			limit := dayMinuteCap(weeklyBudget, len(dates), dm.duration, dayStart)
+			// Take the emptiest day first. Walking the week in date order packed
+			// the first available day to its cap and left the others bare, which
+			// is how someone who asked for Mon/Tue/Fri got two back-to-back
+			// evenings and a free Monday.
+			cand := make([]time.Time, len(dates))
+			copy(cand, dates)
+			sort.SliceStable(cand, func(i, j int) bool {
+				si := slotFor(slots, dateStr(cand[i]), dayStart)
+				sj := slotFor(slots, dateStr(cand[j]), dayStart)
+				if si.minutes != sj.minutes {
+					return si.minutes < sj.minutes
+				}
+				return cand[i].Before(cand[j])
+			})
+			for _, d := range cand {
 				ds := dateStr(d)
-				s := slotFor(slots, ds)
+				s := slotFor(slots, ds, dayStart)
 				if s.count >= maxSessionsPerDay {
 					continue
 				}
 				if s.minutes+dm.duration > limit {
+					continue
+				}
+				// Nothing may end after the cutoff. dayStartFor has already
+				// widened the day to hold the user's stated load, so hitting
+				// this means the day is genuinely full: try another one.
+				if s.nextStart+dm.duration > dayEndMinute {
 					continue
 				}
 				events = append(events, &CalendarEvent{
@@ -340,21 +369,43 @@ func (sc *Scheduler) Schedule(plan *Plan, existing []*CalendarEvent) []*Calendar
 
 // dayMinuteCap allows a day to run up to 1.5x the week's average so a single
 // long session still fits, but never less than the session being placed.
-func dayMinuteCap(weeklyBudget, daysInWeek, need int) int {
+func dayMinuteCap(weeklyBudget, daysInWeek, need, dayStart int) int {
 	if daysInWeek <= 0 {
 		return need
 	}
 	perDay := (weeklyBudget * 3) / (2 * daysInWeek)
+	// Never more than the day physically holds: the 1.5x allowance is there so
+	// one long session still fits, not so a day can absorb the whole week.
+	if window := dayEndMinute - dayStart; perDay > window {
+		perDay = window
+	}
 	return maxInt(perDay, need)
 }
 
-func slotFor(slots map[string]*daySlot, date string) *daySlot {
+func slotFor(slots map[string]*daySlot, date string, dayStart int) *daySlot {
 	if s, ok := slots[date]; ok {
 		return s
 	}
-	s := &daySlot{nextStart: dayStartMinute}
+	s := &daySlot{nextStart: dayStart}
 	slots[date] = s
 	return s
+}
+
+// dayStartFor picks the hour sessions begin on a study day.
+//
+// The evening slot is the default, but it is only four hours long, and someone
+// who commits 14 hours a week across three days has asked for nearly five hours
+// a day. Anchoring those to 18:00 regardless ran the last session past
+// midnight. So the start moves earlier — and only earlier — by however much the
+// user's own stated load needs, never past dayFloorMinute.
+func dayStartFor(weeklyBudget, daysInWeek int) int {
+	if daysInWeek <= 0 || weeklyBudget <= 0 {
+		return dayStartMinute
+	}
+	perDay := (weeklyBudget + daysInWeek - 1) / daysInWeek
+	need := perDay + slotGapMinute*(maxSessionsPerDay-1)
+	start := (dayEndMinute - need) / 15 * 15 // land on a quarter hour
+	return clamp(start, dayFloorMinute, dayStartMinute)
 }
 
 // memoWeekDates returns the placeable dates of week w, computed once per week.
@@ -488,6 +539,7 @@ func (sc *Scheduler) rolloverPlan(planID, userID string, ref time.Time) (Rollove
 		if weeklyBudget <= 0 {
 			weeklyBudget = defaultHoursWeek * 60
 		}
+		dayStart := dayStartFor(weeklyBudget, len(dayset))
 
 		slots := map[string]*daySlot{}
 		var missed []*CalendarEvent
@@ -497,7 +549,7 @@ func (sc *Scheduler) rolloverPlan(planID, userID string, ref time.Time) (Rollove
 				missed = append(missed, ev)
 				continue
 			}
-			s := slotFor(slots, ev.Date)
+			s := slotFor(slots, ev.Date, dayStart)
 			s.count++
 			s.minutes += ev.DurationMin
 			if end := startMinuteOf(ev.StartTime) + ev.DurationMin + slotGapMinute; end > s.nextStart {
@@ -509,7 +561,7 @@ func (sc *Scheduler) rolloverPlan(planID, userID string, ref time.Time) (Rollove
 		}
 
 		oldFinish := plan.FinishDate
-		dayCap := dayMinuteCap(weeklyBudget, maxInt(1, len(dayset)), 0)
+		dayCap := dayMinuteCap(weeklyBudget, maxInt(1, len(dayset)), 0, dayStart)
 
 		cursor := ref
 		for _, ev := range missed {
@@ -518,8 +570,9 @@ func (sc *Scheduler) rolloverPlan(planID, userID string, ref time.Time) (Rollove
 			for guard := 0; guard < 3000 && !placed; guard++ {
 				ds := dateStr(cursor)
 				if dayset[cursor.Weekday()] {
-					s := slotFor(slots, ds)
-					if s.count < maxSessionsPerDay && s.minutes+ev.DurationMin <= limit {
+					s := slotFor(slots, ds, dayStart)
+					if s.count < maxSessionsPerDay && s.minutes+ev.DurationMin <= limit &&
+						s.nextStart+ev.DurationMin <= dayEndMinute {
 						ev.Date = ds
 						ev.StartTime = formatMinute(s.nextStart)
 						ev.RolledOver++

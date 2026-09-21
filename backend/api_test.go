@@ -122,8 +122,11 @@ func (c *client) buildPlanInZone(zone string) (sessionID, planID string) {
 	c.do("POST", "/api/session", map[string]any{"lang": "en", "timezone": zone}, &s)
 	sessionID, _ = s["sessionId"].(string)
 
+	// The last message is the go-ahead: nothing is built until the user
+	// approves the recap at the confirm_plan stage.
 	script := []string{"I want IELTS 7.0", "Academic", "band 5.5", "band 7.0",
-		"2026-12-01", "10 hours a week on Mon Wed Fri", "free materials"}
+		"2026-12-01", "10 hours a week on Mon Wed Fri", "free materials",
+		"yes, build my plan"}
 	for _, msg := range script {
 		var turn map[string]any
 		c.do("POST", "/api/chat", map[string]any{"sessionId": sessionID, "message": msg}, &turn)
@@ -252,7 +255,7 @@ func TestICSFilenameIsSanitized(t *testing.T) {
 
 	evil := `xx"; filename="owned.txt`
 	planID := ""
-	for _, msg := range []string{evil, "beginner", "goal", "2026-12-01", "5 hours", "free", "more"} {
+	for _, msg := range []string{evil, "beginner", "goal", "2026-12-01", "5 hours", "free", "more", "yes, build my plan"} {
 		var turn map[string]any
 		c.do("POST", "/api/chat", map[string]any{"sessionId": sid, "message": msg}, &turn)
 		if id, _ := turn["planId"].(string); id != "" {

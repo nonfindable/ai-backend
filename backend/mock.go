@@ -521,3 +521,96 @@ func firstMatch(s string, keys []string) string {
 	}
 	return ""
 }
+
+// affirmatives are the ways a user says "go ahead" in the three supported
+// languages, matched as word-start stems so "да" does not fire inside "дальше".
+var affirmatives = []string{
+	"yes", "yeah", "yep", "ok", "okay", "sure", "go ahead", "build", "confirm", "proceed",
+	"да", "давай", "конечно", "стро", "состав", "подтвер",
+	"ha", "mayli", "albatta", "tuz", "boshla", "roziman",
+}
+
+// negatives veto an affirmative, because the stems above happily match inside a
+// refusal: "not sure" contains "sure" and was read as a green light, building a
+// plan for someone who had just said they were undecided. Approval has to be
+// unambiguous — anything else returns to the recap, which costs a turn, while
+// guessing wrong costs a plan nobody agreed to.
+var negatives = []string{
+	"no", "not", "nope", "wait", "hold", "change", "instead", "rather",
+	"нет", "не", "подожд", "измен", "друг",
+	"yo'q", "emas", "kut", "o'zgart", "boshqa",
+}
+
+// approvesPlan reports a clear, unambiguous go-ahead.
+func approvesPlan(latest string) bool {
+	lower := strings.ToLower(latest)
+	if containsAny(lower, negatives) {
+		return false
+	}
+	return containsAny(lower, affirmatives)
+}
+
+// mockConfirm is the no-key stand-in for the confirmation gate. Without it the
+// mock pipeline skipped straight from the interview to a plan, so the stage the
+// user has to approve — the one a frontend most needs to build against — could
+// only be exercised by spending real tokens.
+//
+// It does not estimate how long a skill takes; that is the one thing this file
+// cannot fake honestly. It reports the hours the user has and asks.
+func mockConfirm(sess *IntakeSession, availableHours int, latest string) feasibilityResult {
+	lang := sess.Lang
+	a := sess.Answers
+
+	line := func(label, value string) string {
+		if strings.TrimSpace(value) == "" {
+			return ""
+		}
+		return "- " + label + ": " + value + "\n"
+	}
+	var sb strings.Builder
+	sb.WriteString(line(tr(lang, "Starting point", "Сейчас", "Hozirgi daraja"), a.CurrentLevel))
+	sb.WriteString(line(tr(lang, "Target", "Цель", "Maqsad"), a.Target))
+	sb.WriteString(line(tr(lang, "Deadline", "Срок", "Muddat"), a.Deadline))
+	if a.HoursPerWeek > 0 {
+		sb.WriteString(line(tr(lang, "Hours per week", "Часов в неделю", "Haftasiga soat"), itoa(a.HoursPerWeek)))
+	}
+	sb.WriteString(line(tr(lang, "Days", "Дни", "Kunlar"), strings.Join(a.Days, ", ")))
+	sb.WriteString(line(tr(lang, "Budget", "Бюджет", "Byudjet"), a.Budget))
+	for _, n := range sess.PlanNotes {
+		sb.WriteString(line(tr(lang, "Note", "Заметка", "Eslatma"), n))
+	}
+
+	verdict := ""
+	if availableHours > 0 {
+		verdict = tr(lang,
+			"That gives you about "+itoa(availableHours)+" hours of practice before your deadline.",
+			"Это даёт около "+itoa(availableHours)+" часов практики до вашего срока.",
+			"Bu muddatingizgacha taxminan "+itoa(availableHours)+" soat mashq beradi.")
+	}
+	question := tr(lang,
+		"Shall I build your plan from this?",
+		"Составить план на этой основе?",
+		"Shu asosda rejangizni tuzaymi?")
+
+	r := feasibilityResult{
+		AvailableHours: availableHours,
+		Reachable:      true,
+		Summary:        strings.TrimRight(sb.String(), "\n"),
+		Verdict:        verdict,
+		Question:       question,
+	}
+	if strings.TrimSpace(latest) == "" {
+		return r
+	}
+	// A reply: anything affirmative goes ahead, anything else comes back here.
+	r.Decision.Resolved = true
+	r.Decision.KeepOriginal = true
+	r.Decision.Approved = approvesPlan(latest)
+	if !r.Decision.Approved {
+		r.Question = tr(lang,
+			"Tell me what to change, or say yes and I'll build it.",
+			"Скажите, что изменить, или ответьте «да», и я составлю план.",
+			"Nimani o'zgartirishni ayting yoki «ha» deng — men rejani tuzaman.")
+	}
+	return r
+}

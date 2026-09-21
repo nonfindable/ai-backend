@@ -129,7 +129,7 @@ func TestScheduleNeverExceedsPerDayLimits(t *testing.T) {
 	}
 	// 10 h/week over 5 days, so no day should hold an unreasonable block.
 	budget := plan.HoursPerWeek * 60
-	limit := dayMinuteCap(budget, len(plan.Days), 0)
+	limit := dayMinuteCap(budget, len(plan.Days), 0, dayStartFor(budget, len(plan.Days)))
 	for d, n := range perDayCount {
 		if n > maxSessionsPerDay {
 			t.Errorf("%s has %d sessions, max is %d", d, n, maxSessionsPerDay)
@@ -458,5 +458,57 @@ func TestDensePlanStillFitsItsPhaseWindows(t *testing.T) {
 	last := weekOf(t, plan, events[len(events)-1].Date) + 1
 	if last > plan.WeeksTotal {
 		t.Errorf("schedule ends in week %d of a %d-week plan", last, plan.WeeksTotal)
+	}
+}
+
+// A heavy week must not run into the night. 14 hours across three days is
+// nearly five hours a day, which does not fit the default 18:00 evening slot —
+// anchoring to it regardless pushed the last session past midnight.
+func TestScheduleKeepsSessionsInsideTheDayWindow(t *testing.T) {
+	plan := testPlan(t)
+	plan.HoursPerWeek = 14
+	plan.Days = []string{"Mon", "Tue", "Fri"}
+
+	events := (&Scheduler{}).Schedule(plan, nil)
+	if len(events) == 0 {
+		t.Fatal("nothing was scheduled")
+	}
+	for _, e := range events {
+		start := startMinuteOf(e.StartTime)
+		if start < dayFloorMinute {
+			t.Errorf("%s %s starts before the %s floor", e.Date, e.StartTime, formatMinute(dayFloorMinute))
+		}
+		if end := start + e.DurationMin; end > dayEndMinute {
+			t.Errorf("%s %s runs to %s, past the %s cutoff",
+				e.Date, e.StartTime, formatMinute(end), formatMinute(dayEndMinute))
+		}
+	}
+}
+
+// Every session must land on a day the user actually chose, and the week must
+// spread over those days rather than packing the first one to its cap.
+func TestScheduleSpreadsOverTheChosenDays(t *testing.T) {
+	plan := testPlan(t)
+	plan.HoursPerWeek = 14
+	plan.Days = []string{"Mon", "Tue", "Fri"}
+	want := parseWeekdaySet(plan.Days)
+
+	events := (&Scheduler{}).Schedule(plan, nil)
+	loc := loadLocation(plan.Timezone)
+	used := map[time.Weekday]int{}
+	for _, e := range events {
+		d, ok := parseDateIn(e.Date, loc)
+		if !ok {
+			t.Fatalf("event %s has an unparsable date %q", e.ID, e.Date)
+		}
+		if !want[d.Weekday()] {
+			t.Errorf("%s falls on %s, which the user did not choose", e.Date, d.Weekday())
+		}
+		used[d.Weekday()]++
+	}
+	for wd := range want {
+		if used[wd] == 0 {
+			t.Errorf("%s was chosen but never used; the week is not spreading", wd)
+		}
 	}
 }

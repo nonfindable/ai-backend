@@ -300,3 +300,18 @@ func (k *keyedMutex) Lock(key string) func() {
 		k.mu.Unlock()
 	}
 }
+
+// extractJSONObject returns the outermost { ... } in s, tolerating a model that
+// wraps its answer in a markdown fence or a line of preamble despite being told
+// not to. It deliberately does not repair the JSON itself: a response cut off
+// by the token cap still fails to parse, which is what the caller must be told.
+func extractJSONObject(s string) string {
+	t := strings.TrimSpace(s)
+	if i := strings.Index(t, "{"); i > 0 {
+		t = t[i:]
+	}
+	if j := strings.LastIndex(t, "}"); j >= 0 {
+		t = t[:j+1]
+	}
+	return t
+}

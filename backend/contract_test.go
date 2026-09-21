@@ -24,14 +24,17 @@ func chatTurn(t *testing.T, c *client, sessionID, msg string) Turn {
 func TestChatOnlyEmitsDocumentedStages(t *testing.T) {
 	valid := map[string]bool{
 		"scope_check": true, "out_of_scope": true, "disambiguation": true,
-		"intake": true, "plan_ready": true,
+		"intake": true, "confirm_plan": true, "plan_ready": true,
 	}
 	ts := newTestServer(t)
 	c := ts.newClient(t)
 	sess := newSession(t, c)
 
+	// The last message is the go-ahead: nothing is built until the user
+	// approves the recap at the confirm_plan stage.
 	script := []string{"I want IELTS 7.0", "Academic", "band 5.5", "band 7.0",
-		"2026-12-01", "10 hours a week on Mon Wed Fri", "free materials"}
+		"2026-12-01", "10 hours a week on Mon Wed Fri", "free materials",
+		"yes, build my plan"}
 	for _, msg := range script {
 		turn := chatTurn(t, c, sess, msg)
 		if !valid[turn.Stage] {
@@ -137,6 +140,11 @@ func TestIntakeTerminatesWithinItsDeclaredCeiling(t *testing.T) {
 	for turn.Stage == "intake" && asked <= maxIntakeQuestions+2 {
 		turn = chatTurn(t, c, sess, "something")
 		asked++
+	}
+	// The interview ends at the recap, which has to be approved before a plan
+	// exists. That approval is not one of the interview's questions.
+	if turn.Stage == "confirm_plan" {
+		turn = chatTurn(t, c, sess, "yes, build my plan")
 	}
 	if turn.Stage != "plan_ready" {
 		t.Fatalf("interview did not finish: stage %q after %d answers", turn.Stage, asked)

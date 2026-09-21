@@ -63,7 +63,7 @@ type IntakeSession struct {
 	ID                  string            `json:"id"`
 	UserID              string            `json:"userId"`
 	GoalID              string            `json:"goalId"`
-	Stage               string            `json:"stage"` // scope_check|disambiguation|intake|plan_ready|out_of_scope
+	Stage               string            `json:"stage"` // scope_check|disambiguation|intake|feasibility_check|plan_ready|out_of_scope
 	Lang                string            `json:"lang"`  // en|ru|uz
 	Skill               string            `json:"skill"`
 	Path                string            `json:"path"`
@@ -74,9 +74,23 @@ type IntakeSession struct {
 	Answers             FrameworkAnswers  `json:"answers"`
 	AnswerBag           map[string]string `json:"answerBag"` // raw answers keyed by category
 	AskedCount          int               `json:"askedCount"`
-	PlanID              string            `json:"planId"`
-	CreatedAt           time.Time         `json:"createdAt"`
-	UpdatedAt           time.Time         `json:"updatedAt"`
+
+	// The confirmation step that stands between the interview and the plan.
+	// FeasibilityNote is the verdict the user was shown; FeasibilityAgreed
+	// records that they read the recap and said go ahead. No plan is built
+	// until that is true, so nobody is handed a schedule they never approved
+	// or a goal the numbers never supported.
+	FeasibilityNote   string `json:"feasibilityNote,omitempty"`
+	FeasibilityAgreed bool   `json:"feasibilityAgreed"`
+
+	// PlanNotes collects the things the user asked for in passing — "can we use
+	// Anki?", "I'd rather not do speaking drills" — so a request made during the
+	// interview reaches the plan instead of being lost with the message.
+	PlanNotes []string `json:"planNotes,omitempty"`
+
+	PlanID    string    `json:"planId"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 func (s *IntakeSession) clone() *IntakeSession {
@@ -86,6 +100,7 @@ func (s *IntakeSession) clone() *IntakeSession {
 	c := *s
 	c.Messages = append([]Message(nil), s.Messages...)
 	c.Answers.Days = append([]string(nil), s.Answers.Days...)
+	c.PlanNotes = append([]string(nil), s.PlanNotes...)
 	if s.AnswerBag != nil {
 		c.AnswerBag = make(map[string]string, len(s.AnswerBag))
 		for k, v := range s.AnswerBag {

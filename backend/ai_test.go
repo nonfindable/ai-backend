@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // fakeOpenAI stands in for the upstream API and records how it was called.
@@ -353,5 +354,107 @@ func TestAILiveDefaultsToTrue(t *testing.T) {
 	t.Setenv("AI_LIVE", "true")
 	if cfg := loadConfig(); !cfg.AILive {
 		t.Error("AI_LIVE=true should be honoured")
+	}
+}
+
+// The provider tells us when its window reopens. Ignoring that and retrying on
+// our own 400ms/800ms/1200ms schedule meant all three attempts landed inside a
+// window that still had eight seconds to run, and a call that would have
+// succeeded was reported to the user as a failure.
+func TestRetryAfterIsTakenFromTheProvider(t *testing.T) {
+	groq429 := []byte(`{"error":{"message":"Rate limit reached for model ` +
+		"`openai/gpt-oss-120b`" +
+		` in organization ` + "`org_x`" + ` service tier ` + "`on_demand`" +
+		` on tokens per minute (TPM): Limit 8000, Used 6272, Requested 2800. Please try again in 8.04s.","type":"tokens","code":"rate_limit_exceeded"}}`)
+
+	if got := retryAfterFrom(http.Header{}, groq429); got < 8*time.Second || got > 9*time.Second {
+		t.Errorf("parsed wait = %v, want ~8.04s from the message body", got)
+	}
+
+	cases := []struct {
+		name string
+		hdr  http.Header
+		body []byte
+		want time.Duration
+	}{
+		{"header wins over body", http.Header{"Retry-After": []string{"12"}}, groq429, 12 * time.Second},
+		{"milliseconds", http.Header{}, []byte("please try again in 750ms"), 750 * time.Millisecond},
+		{"minutes", http.Header{}, []byte("try again in 20m"), 20 * time.Minute},
+		{"nothing to parse", http.Header{}, []byte("service unavailable"), 0},
+		{"malformed header falls through", http.Header{"Retry-After": []string{"soon"}}, []byte("no hint"), 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retryAfterFrom(tc.hdr, tc.body); got != tc.want {
+				t.Errorf("retryAfterFrom = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A throttle that says "wait 20 minutes" must not hold a request open that long.
+func TestRetryWaitIsBounded(t *testing.T) {
+	if got := retryAfterFrom(http.Header{}, []byte("try again in 45m")); got <= maxRetryWait {
+		t.Fatalf("parsed %v; the test needs a value above the cap to be meaningful", got)
+	}
+	// The cap is applied in Chat's retry loop; assert the constant is sane.
+	if maxRetryWait < 5*time.Second || maxRetryWait > time.Minute {
+		t.Errorf("maxRetryWait = %v, want a few seconds to a minute", maxRetryWait)
+	}
+}
+
+// A throttled call must recover by waiting out the window the provider named,
+// not fail after three sub-second retries that all land inside it.
+func TestGatewayWaitsOutAThrottleAndSucceeds(t *testing.T) {
+	srv, calls := fakeOpenAI(t, func(n int64, w http.ResponseWriter) {
+		if n == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"Rate limit reached on tokens per minute (TPM): Limit 8000, Used 6272, Requested 2800. Please try again in 0.4s.","code":"rate_limit_exceeded"}}`))
+			return
+		}
+		okResponse(w, `{"ok":true}`)
+	})
+	g := testGateway(t, srv.URL)
+	defer g.Close()
+
+	start := time.Now()
+	out, err := g.Chat(context.Background(), "u1", "gpt-4o", "sys", "user", true, "")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("a throttle with a 0.4s hint should have been waited out, got: %v", err)
+	}
+	if out != `{"ok":true}` {
+		t.Errorf("content = %q, want the retried response", out)
+	}
+	if elapsed < 400*time.Millisecond {
+		t.Errorf("retried after %v; the provider asked for 0.4s", elapsed)
+	}
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Errorf("upstream called %d times, want 2 (throttled, then retried)", got)
+	}
+}
+
+// The user's quota must survive a throttle that resolves: they got their answer.
+func TestThrottleThatSucceedsStillChargesOnlyOneCall(t *testing.T) {
+	srv, _ := fakeOpenAI(t, func(n int64, w http.ResponseWriter) {
+		if n == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"try again in 0.2s"}}`))
+			return
+		}
+		okResponse(w, "fine")
+	})
+	g := testGateway(t, srv.URL)
+	defer g.Close()
+
+	if _, err := g.Chat(context.Background(), "u1", "gpt-4o", "sys", "user", false, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	g.mu.Lock()
+	used := g.dailyUse["u1"]
+	g.mu.Unlock()
+	if used != 1 {
+		t.Errorf("dailyUse = %d, want 1: a retried call is still one delivered answer", used)
 	}
 }
