@@ -92,6 +92,19 @@ func cacheKeyFor(stage, lang, payload string) string {
 	return stage + ":" + hex.EncodeToString(sum[:16])
 }
 
+// cacheKeyForTurns is cacheKeyFor with the conversation folded in.
+//
+// Without it the cache is actively wrong once the model can see history: two
+// learners at the confirmation gate, one at IELTS 4.5 and one at 7.5, both
+// typing "what do you think?" produce the same stage, language and latest
+// message — and the second would have been served the first one's answer. The
+// digest of the exact bounded window that will be sent makes the key as
+// specific as the call it stands for. No token or identity goes in: the window
+// content already separates conversations.
+func cacheKeyForTurns(stage, lang, payload string, history []promptMessage) string {
+	return cacheKeyFor(stage, lang, payload+"\x00hist:"+conversationDigest(history))
+}
+
 // rough per-1K-token USD rates, used only for the demo cost meter. Both the
 // OpenAI and Groq model families are listed because the gateway is provider-
 // agnostic (any OpenAI-compatible base URL works); an unlisted model falls to a
@@ -165,6 +178,18 @@ const (
 // Chat runs one completion through all the gateway protections and returns the
 // assistant text. cacheKey (when non-empty) enables caching for repeatable calls.
 func (g *Gateway) Chat(ctx context.Context, userID, model, system, user string, jsonMode bool, cacheKey string) (string, error) {
+	return g.ChatTurns(ctx, userID, model, []oaMsg{
+		{Role: "system", Content: system},
+		{Role: "user", Content: user},
+	}, jsonMode, cacheKey)
+}
+
+// ChatTurns is Chat over a full message list, so a stage can replay the
+// conversation as real user/assistant turns instead of pasting a transcript
+// into one composed string. That is the trust boundary: a stored user message
+// is delivered to the provider AS a user message and can never arrive wearing
+// the system role. See conversation.go.
+func (g *Gateway) ChatTurns(ctx context.Context, userID, model string, msgs []oaMsg, jsonMode bool, cacheKey string) (string, error) {
 	if !g.Enabled() {
 		return "", fmt.Errorf("%w: set AI_LIVE=true and OPENAI_API_KEY", errGatewayDisabled)
 	}
@@ -214,7 +239,7 @@ func (g *Gateway) Chat(ctx context.Context, userID, model, system, user string, 
 	for _, m := range models {
 		fatal := false
 		for attempt := 0; attempt < 3; attempt++ {
-			out, class, wait, err := g.callOnce(ctx, m, system, user, jsonMode)
+			out, class, wait, err := g.callOnce(ctx, m, msgs, jsonMode)
 			lastClass = class
 			if err == nil && class == classOK {
 				if cacheKey != "" {
@@ -376,16 +401,13 @@ func retryAfterFrom(h http.Header, body []byte) time.Duration {
 	return 0
 }
 
-func (g *Gateway) callOnce(ctx context.Context, model, system, user string, jsonMode bool) (string, callClass, time.Duration, error) {
+func (g *Gateway) callOnce(ctx context.Context, model string, msgs []oaMsg, jsonMode bool) (string, callClass, time.Duration, error) {
 	reqBody := oaReq{
 		Model:               model,
 		Temperature:         0.4,
 		MaxCompletionTokens: g.cfg.MaxCompletionTokens,
 		ReasoningEffort:     g.cfg.ReasoningEffort,
-		Messages: []oaMsg{
-			{Role: "system", Content: system},
-			{Role: "user", Content: user},
-		},
+		Messages:            msgs,
 	}
 	if jsonMode {
 		reqBody.ResponseFormat = &oaRespFormat{Type: "json_object"}

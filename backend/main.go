@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -70,6 +71,14 @@ func main() {
 	}
 	log.Printf("start.ai backend listening on :%s", cfg.Port)
 	log.Printf("AI mode: %s", mode)
+	// Say plainly whether product lookups can happen. None ship with this
+	// build, and a silent absence would read as "search is on but found
+	// nothing" — which is how fabricated recommendations get believed.
+	if names := pipe.res.ProviderNames(); len(names) > 0 {
+		log.Printf("resource providers: %s", strings.Join(names, ", "))
+	} else {
+		log.Printf("resource providers: NONE configured — no verified prices or stock; plans carry shop SEARCH links only (Uzum, Yandex Market, Coursera, Udemy, Stepik)")
+	}
 	if cfg.FrontendDir != "" {
 		if fi, err := staticStat(cfg.FrontendDir); err == nil && fi.IsDir() {
 			log.Printf("serving frontend from %s → open http://localhost:%s", cfg.FrontendDir, cfg.Port)

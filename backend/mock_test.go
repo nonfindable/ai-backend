@@ -83,6 +83,11 @@ func TestParseHoursPerWeekIgnoresDates(t *testing.T) {
 	}
 }
 
+// A date answer must not become an hours-per-week count — and, since nothing in
+// it states an availability, it must not quietly become the six-hour default
+// either. Inventing that default is how a learner who never said when they
+// could study ended up with a plan sized against time they did not have; the
+// interview now comes back and asks instead.
 func TestIngestAnswerDoesNotTurnADateIntoHours(t *testing.T) {
 	sess := &IntakeSession{Lang: "en", AnswerBag: map[string]string{}}
 	for _, msg := range []string{"complete beginner", "band 7.0", "2026-12-01", "2026-12-01"} {
@@ -91,8 +96,12 @@ func TestIngestAnswerDoesNotTurnADateIntoHours(t *testing.T) {
 	if sess.Answers.HoursPerWeek == 60 {
 		t.Fatal("a date answer was parsed as 60 hours per week")
 	}
-	if sess.Answers.HoursPerWeek != defaultHoursWeek {
-		t.Errorf("HoursPerWeek = %d, want the %d-hour default", sess.Answers.HoursPerWeek, defaultHoursWeek)
+	if sess.Answers.HoursPerWeek != 0 || sess.Answers.Availability.HasTime() {
+		t.Errorf("HoursPerWeek = %d / availability %+v, want availability left UNKNOWN: a deadline says nothing about study time",
+			sess.Answers.HoursPerWeek, sess.Answers.Availability)
+	}
+	if sess.Answers.Availability.Complete() {
+		t.Error("availability must not be complete when the user never gave one")
 	}
 	if sess.Answers.Deadline != "2026-12-01" {
 		t.Errorf("Deadline = %q, want 2026-12-01", sess.Answers.Deadline)

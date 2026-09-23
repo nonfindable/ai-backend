@@ -265,7 +265,7 @@ func (a *API) handlePlan(w http.ResponseWriter, r *http.Request, user *User) {
 		writeAPIError(w, 404, codePlanNotFound)
 		return
 	}
-	writeJSON(w, 200, plan)
+	writeJSON(w, 200, withShopLinks(plan, a.cfg.MarketplaceCountry))
 }
 
 type planRef struct {

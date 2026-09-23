@@ -234,10 +234,7 @@ func mockIntake(sess *IntakeSession, latest string) intakeResult {
 			"Есть ли срок или дата экзамена? (дата или «без срока»)",
 			"Muddat yoki imtihon sanasi bormi? (sana yoki «muddatsiz»)"),
 			[]string{tr(lang, "No deadline", "Без срока", "Muddatsiz")}},
-		q{"time", tr(lang,
-			"How many hours a week can you commit, and which days?",
-			"Сколько часов в неделю вы можете уделять и в какие дни?",
-			"Haftasiga necha soat ajrata olasiz va qaysi kunlari?"), nil},
+		q{"time", mockTimeQuestion(sess), nil},
 		q{"budget", tr(lang,
 			"What's your budget for materials or gear?",
 			"Какой у вас бюджет на материалы или оборудование?",
@@ -260,6 +257,36 @@ func mockIntake(sess *IntakeSession, latest string) intakeResult {
 	return res
 }
 
+// mockTimeAskLimit bounds how often the no-key interview may come back for the
+// availability it still needs, so an unparseable answer cannot loop.
+const mockTimeAskLimit = 2
+
+// mockTimeQuestion asks only for the half of the availability that is missing.
+// Asking someone who just said "Monday and Saturday" which days they can study
+// is the redundancy the interview is supposed to avoid.
+func mockTimeQuestion(sess *IntakeSession) string {
+	lang := sess.Lang
+	switch missingAvailability(currentAvailability(sess)) {
+	case "days":
+		return tr(lang,
+			"Which days of the week can you study?",
+			"В какие дни недели вы можете заниматься?",
+			"Haftaning qaysi kunlari shug'ullana olasiz?")
+	case "time":
+		return tr(lang,
+			"How much time can you give it on those days — per day, or per week?",
+			"Сколько времени вы можете уделять в эти дни — в день или в неделю?",
+			"O'sha kunlari qancha vaqt ajrata olasiz — kuniga yoki haftasiga?")
+	default:
+		return tr(lang,
+			"Which days can you study, and how much time on each?",
+			"В какие дни вы можете заниматься и сколько времени в каждый?",
+			"Qaysi kunlari shug'ullana olasiz va har birida qancha vaqt?")
+	}
+}
+
+func mockTimeAsks(sess *IntakeSession) int { return atoi(sess.AnswerBag["time_asks"]) }
+
 func pivotalOptions(sess *IntakeSession) []string {
 	for _, ks := range knownSkills {
 		if ks.def.name == sess.Skill {
@@ -281,7 +308,11 @@ func answered(sess *IntakeSession, key string) bool {
 	case "deadline":
 		return a.Deadline != "" || sess.AnswerBag["deadline_asked"] == "yes"
 	case "time":
-		return a.HoursPerWeek > 0
+		// Both halves, or the allowance is spent. A weekly figure with no days
+		// (or days with no hours) cannot be scheduled and must not be treated
+		// as an answer — that is how an unstated availability used to become a
+		// silent six-hour default.
+		return currentAvailability(sess).Complete() || mockTimeAsks(sess) >= mockTimeAskLimit
 	case "budget":
 		return a.Budget != ""
 	}
@@ -326,13 +357,15 @@ func ingestAnswer(sess *IntakeSession, latest string) {
 		}
 		return
 	}
-	if a.HoursPerWeek == 0 {
-		if h, ok := parseHoursPerWeek(latest); ok {
-			a.HoursPerWeek = h
-		} else {
-			a.HoursPerWeek = defaultHoursWeek
+	if !currentAvailability(sess).Complete() && mockTimeAsks(sess) < mockTimeAskLimit {
+		sess.AnswerBag["time_asks"] = itoa(mockTimeAsks(sess) + 1)
+		// Deterministic parsing, same as the live path: the backend does this
+		// arithmetic. Nothing is invented when the answer says nothing — an
+		// unparseable reply leaves availability incomplete and earns one more
+		// question rather than a default the learner never chose.
+		if parsed := parseAvailabilityAnswer(latest); parsed.HasDays() || parsed.HasTime() {
+			syncAnswersAvailability(sess, mergeAvailability(currentAvailability(sess), parsed))
 		}
-		a.Days = detectDays(lower)
 		return
 	}
 	if a.Budget == "" {
@@ -486,18 +519,18 @@ func mockSetup(skill, lang string) []setupAI {
 	if strings.EqualFold(skill, "IELTS") {
 		return []setupAI{
 			{tr(lang, "Official Cambridge IELTS practice books", "Официальные сборники Cambridge IELTS", "Rasmiy Cambridge IELTS mashq kitoblari"), "materials", "high", "$0-25", false,
-				tr(lang, "The single best-value resource; older editions and library copies are near-free.", "Лучший по соотношению цена/польза; старые издания и библиотека — почти бесплатно.", "Eng foydali resurs; eski nashrlar va kutubxona nusxalari deyarli bepul.")},
+				tr(lang, "The single best-value resource; older editions and library copies are near-free.", "Лучший по соотношению цена/польза; старые издания и библиотека — почти бесплатно.", "Eng foydali resurs; eski nashrlar va kutubxona nusxalari deyarli bepul."), "Cambridge IELTS"},
 			{tr(lang, "Decent headphones for Listening practice", "Нормальные наушники для Listening", "Listening uchun yaxshi quloqchin"), "gear", "medium", "$15-30", false,
-				tr(lang, "Clear audio matters for the Listening section; you may already own a pair.", "Чистый звук важен для Listening; возможно, у вас уже есть.", "Listening uchun toza ovoz muhim; ehtimol sizda bor.")},
+				tr(lang, "Clear audio matters for the Listening section; you may already own a pair.", "Чистый звук важен для Listening; возможно, у вас уже есть.", "Listening uchun toza ovoz muhim; ehtimol sizda bor."), "наушники"},
 			{tr(lang, "Notebook + timer (phone works)", "Блокнот + таймер (подойдёт телефон)", "Daftar + taymer (telefon ham bo'ladi)"), "gear", "low", "$0", false,
-				tr(lang, "Timed practice is free — use what you have.", "Практика на время бесплатна — используйте то, что есть.", "Vaqtli mashq bepul — bor narsangizdan foydalaning.")},
+				tr(lang, "Timed practice is free — use what you have.", "Практика на время бесплатна — используйте то, что есть.", "Vaqtli mashq bepul — bor narsangizdan foydalaning."), ""},
 		}
 	}
 	return []setupAI{
 		{tr(lang, "Free/low-cost starter materials for "+skill, "Бесплатные/недорогие стартовые материалы по «"+skill+"»", "«"+skill+"» uchun bepul/arzon boshlang'ich materiallar"), "materials", "high", "$0-20", false,
-			tr(lang, "Start with free resources; upgrade only once you hit a real limit.", "Начните с бесплатных ресурсов; улучшайте только при реальном упоре в потолок.", "Bepul resurslardan boshlang; faqat haqiqiy chegaraga yetganda yangilang.")},
+			tr(lang, "Start with free resources; upgrade only once you hit a real limit.", "Начните с бесплатных ресурсов; улучшайте только при реальном упоре в потолок.", "Bepul resurslardan boshlang; faqat haqiqiy chegaraga yetganda yangilang."), skill},
 		{tr(lang, "Basic practice tools you likely already own", "Базовые инструменты, которые у вас, вероятно, уже есть", "Sizda allaqachon bor bo'lishi mumkin bo'lgan asosiy vositalar"), "gear", "low", "$0", false,
-			tr(lang, "Don't buy anything yet — settings and free tools go a long way.", "Пока ничего не покупайте — настроек и бесплатных инструментов достаточно.", "Hozircha hech narsa sotib olmang — sozlamalar va bepul vositalar yetarli.")},
+			tr(lang, "Don't buy anything yet — settings and free tools go a long way.", "Пока ничего не покупайте — настроек и бесплатных инструментов достаточно.", "Hozircha hech narsa sotib olmang — sozlamalar va bepul vositalar yetarli."), ""},
 	}
 }
 
@@ -556,10 +589,12 @@ func approvesPlan(latest string) bool {
 // only be exercised by spending real tokens.
 //
 // It does not estimate how long a skill takes; that is the one thing this file
-// cannot fake honestly. It reports the hours the user has and asks.
-func mockConfirm(sess *IntakeSession, availableHours int, latest string) feasibilityResult {
+// cannot fake honestly. It reports the capacity the user actually has — from
+// their stated availability, never from the span to the deadline — and asks.
+func mockConfirm(sess *IntakeSession, h horizon, latest string) feasibilityResult {
 	lang := sess.Lang
 	a := sess.Answers
+	availableHours := h.studyHours()
 
 	line := func(label, value string) string {
 		if strings.TrimSpace(value) == "" {
@@ -571,21 +606,52 @@ func mockConfirm(sess *IntakeSession, availableHours int, latest string) feasibi
 	sb.WriteString(line(tr(lang, "Starting point", "Сейчас", "Hozirgi daraja"), a.CurrentLevel))
 	sb.WriteString(line(tr(lang, "Target", "Цель", "Maqsad"), a.Target))
 	sb.WriteString(line(tr(lang, "Deadline", "Срок", "Muddat"), a.Deadline))
-	if a.HoursPerWeek > 0 {
-		sb.WriteString(line(tr(lang, "Hours per week", "Часов в неделю", "Haftasiga soat"), itoa(a.HoursPerWeek)))
+	av := currentAvailability(sess)
+	if av.HasTime() {
+		sb.WriteString(line(tr(lang, "Hours per week", "Часов в неделю", "Haftasiga soat"), itoa(av.HoursPerWeek())))
 	}
-	sb.WriteString(line(tr(lang, "Days", "Дни", "Kunlar"), strings.Join(a.Days, ", ")))
+	sb.WriteString(line(tr(lang, "Days", "Дни", "Kunlar"), strings.Join(av.Days, ", ")))
+	for _, pd := range av.PerDay {
+		sb.WriteString(line(pd.Weekday, itoa(pd.Minutes)+tr(lang, " min", " мин", " daqiqa")))
+	}
 	sb.WriteString(line(tr(lang, "Budget", "Бюджет", "Byudjet"), a.Budget))
 	for _, n := range sess.PlanNotes {
 		sb.WriteString(line(tr(lang, "Note", "Заметка", "Eslatma"), n))
 	}
 
+	// The verdict states what is KNOWN and nothing more. This file has no basis
+	// for estimating how many hours a skill takes, so it never implies one —
+	// and where availability is still missing it says so instead of quietly
+	// reporting a capacity derived from a default.
 	verdict := ""
-	if availableHours > 0 {
+	status := unknownStatus
+	switch {
+	case !h.HasDeadline && av.Complete():
+		// No deadline is not a problem to be solved, and certainly not one to
+		// be solved by inventing a year. There is simply nothing to be late
+		// for; the projection line says when this would finish.
+		status = feasibleStatus
 		verdict = tr(lang,
-			"That gives you about "+itoa(availableHours)+" hours of practice before your deadline.",
-			"Это даёт около "+itoa(availableHours)+" часов практики до вашего срока.",
-			"Bu muddatingizgacha taxminan "+itoa(availableHours)+" soat mashq beradi.")
+			"At "+itoa(av.HoursPerWeek())+"h a week on "+strings.Join(av.Days, "/")+", with no deadline set, we can pace this properly.",
+			"При "+itoa(av.HoursPerWeek())+" ч в неделю ("+strings.Join(av.Days, "/")+") и без установленного срока темп можно выстроить спокойно.",
+			"Haftasiga "+itoa(av.HoursPerWeek())+" soat ("+strings.Join(av.Days, "/")+") va muddat belgilanmagan — sur'atni bemalol tanlaymiz.")
+	case !h.CapacityKnown:
+		verdict = tr(lang,
+			"I don't have your study availability yet, so I can't tell you how much practice time this timeline actually gives you.",
+			"У меня пока нет вашей доступности для занятий, поэтому я не могу сказать, сколько практики реально даёт этот срок.",
+			"Menda hali o'quv vaqtingiz yo'q, shuning uchun bu muddat qancha mashq vaqti berishini ayta olmayman.")
+	case a.Deadline != "":
+		status = feasibleStatus
+		verdict = tr(lang,
+			"At "+itoa(av.HoursPerWeek())+"h a week on "+strings.Join(av.Days, "/")+", you have about "+itoa(availableHours)+" scheduled study hours before "+a.Deadline+". I'll build the plan to fit that.",
+			"При "+itoa(av.HoursPerWeek())+" ч в неделю ("+strings.Join(av.Days, "/")+") до "+a.Deadline+" у вас около "+itoa(availableHours)+" запланированных учебных часов. Я составлю план под это.",
+			"Haftasiga "+itoa(av.HoursPerWeek())+" soat ("+strings.Join(av.Days, "/")+") bilan "+a.Deadline+" gacha sizda taxminan "+itoa(availableHours)+" rejalashtirilgan o'quv soati bor. Rejani shunga moslayman.")
+	default:
+		status = feasibleStatus
+		verdict = tr(lang,
+			"At "+itoa(av.HoursPerWeek())+"h a week on "+strings.Join(av.Days, "/")+", with no fixed deadline, we can pace this properly.",
+			"При "+itoa(av.HoursPerWeek())+" ч в неделю ("+strings.Join(av.Days, "/")+") и без жёсткого срока темп можно выстроить спокойно.",
+			"Haftasiga "+itoa(av.HoursPerWeek())+" soat ("+strings.Join(av.Days, "/")+") va qat'iy muddatsiz — sur'atni bemalol belgilaymiz.")
 	}
 	question := tr(lang,
 		"Shall I build your plan from this?",
@@ -594,7 +660,7 @@ func mockConfirm(sess *IntakeSession, availableHours int, latest string) feasibi
 
 	r := feasibilityResult{
 		AvailableHours: availableHours,
-		Reachable:      true,
+		Status:         status,
 		Summary:        strings.TrimRight(sb.String(), "\n"),
 		Verdict:        verdict,
 		Question:       question,

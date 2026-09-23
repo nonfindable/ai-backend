@@ -51,6 +51,13 @@ type Config struct {
 	DefaultTimezone     string
 	RolloverIntervalMin int
 
+	// Marketplace lookups. These only shape the SEARCH (which country's
+	// catalogue, which currency to compare in) — they do not enable anything.
+	// No marketplace provider ships with this build: see resource_providers.go
+	// for why, and for the seam a real one plugs into.
+	MarketplaceCountry  string
+	MarketplaceCurrency string
+
 	// AllowHeaderAuth re-enables identifying a caller by a bare X-User-Id
 	// header. It exists only for local demos and legacy clients: a header the
 	// caller chooses is not authentication, so it defaults to off.
@@ -146,6 +153,8 @@ func loadConfig() Config {
 		FrontendDir:         getenv("FRONTEND_DIR", "../frontend"),
 		DefaultTimezone:     getenv("DEFAULT_TIMEZONE", "Asia/Tashkent"),
 		RolloverIntervalMin: getenvInt("ROLLOVER_INTERVAL_MINUTES", 1440),
+		MarketplaceCountry:  getenv("MARKETPLACE_COUNTRY", "UZ"),
+		MarketplaceCurrency: getenv("MARKETPLACE_CURRENCY", ""),
 		AllowHeaderAuth:     getenvBool("ALLOW_HEADER_AUTH", false),
 	}
 	if cfg.CORSOrigin == "*" {
