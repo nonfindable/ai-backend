@@ -20,7 +20,7 @@ func TestConfirmDecisionAppliesEveryChangedField(t *testing.T) {
 	applyFeasibilityDecision(sess, feasibilityDecision{
 		Resolved: true, Target: "advanced", Deadline: "2027-05-31", HoursPerWeek: 14,
 		Days: []string{"Monday", "Tuesday", "Friday"},
-	})
+	}, "make it 14 hours a week on Monday, Tuesday and Friday")
 
 	a := sess.Answers
 	if a.Target != "advanced" || a.Deadline != "2027-05-31" || a.HoursPerWeek != 14 {
@@ -40,7 +40,7 @@ func TestConfirmDecisionLeavesUntouchedFieldsAlone(t *testing.T) {
 			Days: []string{"Mon", "Wed", "Fri"},
 		},
 	}
-	applyFeasibilityDecision(sess, feasibilityDecision{Resolved: true, HoursPerWeek: 10})
+	applyFeasibilityDecision(sess, feasibilityDecision{Resolved: true, HoursPerWeek: 10}, "make it 10 hours a week")
 	a := sess.Answers
 	if a.Target != "B1" || a.Deadline != "2027-01-31" {
 		t.Errorf("an hours-only change disturbed the goal: %q / %q", a.Target, a.Deadline)
@@ -52,7 +52,7 @@ func TestConfirmDecisionLeavesUntouchedFieldsAlone(t *testing.T) {
 		t.Errorf("days = %v, want them untouched", a.Days)
 	}
 
-	applyFeasibilityDecision(sess, feasibilityDecision{Resolved: true, Days: []string{"someday", "whenever"}})
+	applyFeasibilityDecision(sess, feasibilityDecision{Resolved: true, Days: []string{"someday", "whenever"}}, "someday and whenever, 10 hours a week")
 	if strings.Join(sess.Answers.Days, ",") != "Mon,Wed,Fri" {
 		t.Errorf("days = %v, want the previous set kept when nothing parses", sess.Answers.Days)
 	}
@@ -61,7 +61,7 @@ func TestConfirmDecisionLeavesUntouchedFieldsAlone(t *testing.T) {
 // An out-of-range week is clamped rather than handed to the scheduler.
 func TestConfirmDecisionClampsHours(t *testing.T) {
 	sess := &IntakeSession{Answers: FrameworkAnswers{HoursPerWeek: 6}}
-	applyFeasibilityDecision(sess, feasibilityDecision{Resolved: true, HoursPerWeek: 400})
+	applyFeasibilityDecision(sess, feasibilityDecision{Resolved: true, HoursPerWeek: 60}, "make it 60 hours a week")
 	if sess.Answers.HoursPerWeek != 40 {
 		t.Errorf("hoursPerWeek = %d, want it clamped to 40", sess.Answers.HoursPerWeek)
 	}
@@ -135,8 +135,20 @@ func TestNumericHoursReachTheAnswers(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"answers":{"hoursPerWeek":14,"days":["Mon","Tue","Fri"]}}`), &r); err != nil {
 		t.Fatalf("decode failed: %v", err)
 	}
+	// applyAnswers no longer writes availability: the model's figures are a
+	// claim that has to be corroborated by the learner's own words first. What
+	// is pinned here is that the coerced values decode into the right shape.
+	av := availabilityFromModel(r.Answers)
+	if av.HoursPerWeek() != 14 {
+		t.Errorf("hoursPerWeek = %d, want 14", av.HoursPerWeek())
+	}
+	if strings.Join(av.Days, ",") != "Mon,Tue,Fri" {
+		t.Errorf("days = %v, want Mon,Tue,Fri", av.Days)
+	}
+
+	// And that they do reach the session when the learner really said them.
 	sess := &IntakeSession{}
-	applyAnswers(sess, r.Answers)
+	recordStatedAvailability(sess, "14 hours a week on Mon, Tue and Fri", "timeBudget", r.Answers)
 	if sess.Answers.HoursPerWeek != 14 {
 		t.Errorf("hoursPerWeek = %d, want 14", sess.Answers.HoursPerWeek)
 	}

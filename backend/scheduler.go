@@ -158,11 +158,12 @@ func (sc *Scheduler) Schedule(plan *Plan, existing []*CalendarEvent) []*Calendar
 		earliest = anchor
 	}
 
-	weeklyBudget := plan.HoursPerWeek * 60
-	if weeklyBudget <= 0 {
-		weeklyBudget = defaultHoursWeek * 60
-	}
+	weeklyBudget := planWeeklyMinutes(plan)
 	dayStart := dayStartFor(weeklyBudget, len(dayset))
+	// Per-day limits the learner stated ("Tuesdays I only have 30 minutes").
+	// Without them a day takes its share of the week; with them it takes
+	// exactly what they said it could.
+	perDayCap := planPerDayCaps(plan)
 
 	// Keep finished history exactly where it is; only outstanding work moves.
 	var kept []*CalendarEvent
@@ -293,7 +294,15 @@ func (sc *Scheduler) Schedule(plan *Plan, existing []*CalendarEvent) []*Calendar
 				if s.count >= maxSessionsPerDay {
 					continue
 				}
-				if s.minutes+dm.duration > limit {
+				// A limit the learner stated for THIS weekday is strict: it is
+				// a fact about their life, not a share of a budget, so a
+				// session that does not fit it looks for another day (and is
+				// honestly counted as dropped if no day will take it).
+				dayLimit := limit
+				if c, ok := perDayCap[weekdayCode(d.Weekday())]; ok {
+					dayLimit = c
+				}
+				if s.minutes+dm.duration > dayLimit {
 					continue
 				}
 				// Nothing may end after the cutoff. dayStartFor has already
@@ -365,6 +374,35 @@ func (sc *Scheduler) Schedule(plan *Plan, existing []*CalendarEvent) []*Calendar
 	}
 	applyDeadlineCheck(plan, loc)
 	return events
+}
+
+// planWeeklyMinutes is the single source of the weekly budget. WeeklyMinutes is
+// authoritative when set, because "90 minutes on Tuesdays" cannot be expressed
+// in whole hours; HoursPerWeek remains the fallback for plans built before
+// minutes existed, and the old default is the last resort.
+func planWeeklyMinutes(plan *Plan) int {
+	if plan.WeeklyMinutes > 0 {
+		return plan.WeeklyMinutes
+	}
+	if plan.HoursPerWeek > 0 {
+		return plan.HoursPerWeek * 60
+	}
+	return defaultHoursWeek * 60
+}
+
+// planPerDayCaps indexes the learner's stated per-day limits by weekday code.
+// An empty map means they never gave any, and every day takes its share.
+func planPerDayCaps(plan *Plan) map[string]int {
+	if len(plan.PerDay) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(plan.PerDay))
+	for _, pd := range plan.PerDay {
+		if pd.Minutes > 0 {
+			out[pd.Weekday] = pd.Minutes
+		}
+	}
+	return out
 }
 
 // dayMinuteCap allows a day to run up to 1.5x the week's average so a single
@@ -535,11 +573,9 @@ func (sc *Scheduler) rolloverPlan(planID, userID string, ref time.Time) (Rollove
 		}
 
 		dayset := parseWeekdaySet(plan.Days)
-		weeklyBudget := plan.HoursPerWeek * 60
-		if weeklyBudget <= 0 {
-			weeklyBudget = defaultHoursWeek * 60
-		}
+		weeklyBudget := planWeeklyMinutes(plan)
 		dayStart := dayStartFor(weeklyBudget, len(dayset))
+		perDayCap := planPerDayCaps(plan)
 
 		slots := map[string]*daySlot{}
 		var missed []*CalendarEvent
@@ -571,7 +607,11 @@ func (sc *Scheduler) rolloverPlan(planID, userID string, ref time.Time) (Rollove
 				ds := dateStr(cursor)
 				if dayset[cursor.Weekday()] {
 					s := slotFor(slots, ds, dayStart)
-					if s.count < maxSessionsPerDay && s.minutes+ev.DurationMin <= limit &&
+					dayLimit := limit
+					if c, ok := perDayCap[weekdayCode(cursor.Weekday())]; ok {
+						dayLimit = c
+					}
+					if s.count < maxSessionsPerDay && s.minutes+ev.DurationMin <= dayLimit &&
 						s.nextStart+ev.DurationMin <= dayEndMinute {
 						ev.Date = ds
 						ev.StartTime = formatMinute(s.nextStart)

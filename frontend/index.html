@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="description" content="start.ai — name the goal, and it builds a scheduled roadmap with a finish date it keeps honest." />
+  <title>start.ai</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%235b46e5'/%3E%3Ctext x='16' y='23' font-family='Georgia,serif' font-size='19' font-weight='700' fill='white' text-anchor='middle'%3Es%3C/text%3E%3C/svg%3E" />
+
+  <!-- The typeface is part of the design; the stacks below it mean the app
+       still works with no network to fetch it from. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Space+Mono:wght@400;700&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+
+  <script>
+    // Theme and sidebar state before first paint, so a reload doesn't flash
+    // the wrong one. Storage throws outright in some privacy modes; the page
+    // must still paint.
+    (function () {
+      var read = function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } };
+      var pref = read("startai.theme") || "system";
+      var dark = pref === "dark" || (pref === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+      document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+      var open = read("startai.sidebar") !== "0" && innerWidth > 940;
+      document.documentElement.setAttribute("data-sb", open ? "open" : "closed");
+    })();
+  </script>
+</head>
+<body data-stage="intake">
+
+<!-- ── Chat history: every goal you have started ── -->
+<aside class="sidebar" id="sidebar" aria-label="Chat history">
+  <div class="sb-head">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">s.</div>
+      <div class="wordmark">start<span>.ai</span></div>
+    </div>
+    <button class="sb-icon" type="button" id="sbCollapse" aria-label="Close chat history">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M9.5 4v16"/></svg>
+    </button>
+  </div>
+
+  <button class="sb-new" type="button" id="newChatBtn">
+    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6"/><path d="M18.4 2.6a1.9 1.9 0 0 1 2.7 2.7L12.5 14 9 15l1-3.5z"/></svg>
+    <span data-i18n="new_chat">New chat</span>
+  </button>
+
+  <div class="sb-search">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+    <input id="sbSearch" type="search" autocomplete="off" data-i18n-ph="search_chats" placeholder="Search chats" data-i18n-aria="aria_search" aria-label="Search chats" />
+  </div>
+
+  <nav class="sb-scroll" id="sbList" data-i18n-aria="aria_chat_list" aria-label="Recent chats"></nav>
+
+  <button class="sb-acct" type="button" id="acctBtn" aria-haspopup="menu" aria-expanded="false" data-i18n-aria="aria_account" aria-label="Account and settings">
+    <span class="acct-av" id="acctAv" aria-hidden="true">G</span>
+    <span class="acct-id">
+      <span class="acct-name" id="acctName">Guest</span>
+      <span class="acct-plan" id="acctPlan">Connected</span>
+    </span>
+    <svg class="acct-chev" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+  </button>
+</aside>
+<div class="sb-scrim" id="sbScrim"></div>
+
+<div class="shell">
+  <header class="topbar">
+    <button class="sb-icon topbar-open" type="button" id="sbOpen" data-i18n-aria="aria_sidebar_open" aria-label="Open chat history">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M9.5 4v16"/></svg>
+    </button>
+    <div class="brand">
+      <div class="logo" aria-hidden="true">s.</div>
+      <div class="wordmark">start<span>.ai</span></div>
+    </div>
+
+    <!-- Says plainly when the plans are canned. Dashed, because it is a
+         development state and not a product feature. -->
+    <span class="demo-badge" id="mockBadge" hidden>Mock</span>
+
+    <!-- The learner's own state, in the place they look for it. -->
+    <div class="plan-state" id="planState" hidden>
+      <span class="ps-dot" id="psDot"></span>
+      <span id="psText"></span>
+    </div>
+
+    <div class="controls">
+      <div class="lang-switch" id="langSwitch" role="group" data-i18n-aria="aria_lang" aria-label="Language">
+        <button type="button" data-lang="en" class="active" aria-pressed="true">EN</button>
+        <button type="button" data-lang="ru" aria-pressed="false">RU</button>
+        <button type="button" data-lang="uz" aria-pressed="false">UZ</button>
+      </div>
+      <button class="theme-toggle" id="themeToggle" type="button" aria-pressed="false" aria-label="Switch theme">
+        <svg class="ic ic-sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <svg class="ic ic-moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+      <!-- Developer instrumentation: only present with ?dev=1 -->
+      <div class="meter" id="meter" hidden>
+        <span class="meter-dot" id="meterDot"></span>
+        <span id="meterText"></span>
+      </div>
+    </div>
+  </header>
+
+  <main class="stage" id="stage">
+
+    <!-- ── Intake: the opening question, given the room ── -->
+    <div class="intake-head" id="intakeHead">
+      <h1 data-i18n="intake_h">What do you want to learn?</h1>
+      <p data-i18n="intake_p"></p>
+    </div>
+
+    <!-- ── Goal band: the promise, on every tab ── -->
+    <section class="band" id="goalBand" hidden aria-labelledby="gbTitle">
+      <div class="band-head">
+        <div class="band-id">
+          <h1 class="gb-title" id="gbTitle" tabindex="-1"></h1>
+          <div class="gb-track" id="gbTrack"></div>
+        </div>
+        <div class="gb-chips" id="gbChips"></div>
+      </div>
+
+      <div class="gb-rail" id="gbRail">
+        <div class="rail-track">
+          <span class="rail-fill" id="railFill"></span>
+          <span class="rail-tick start" id="tickStart"></span>
+          <span class="rail-tick now" id="tickNow"></span>
+          <span class="rail-tick end" id="tickEnd"></span>
+          <span class="rail-lbl at-start" id="lblStart"></span>
+          <span class="rail-lbl at-now" id="lblNow"></span>
+          <span class="rail-lbl at-end" id="lblEnd"></span>
+        </div>
+      </div>
+
+      <div class="gb-foot">
+        <span id="gbProgress"></span>
+        <span class="gb-slip" id="gbSlip"></span>
+      </div>
+    </section>
+
+    <!-- ── The plan: the application ── -->
+    <section class="surface" id="surface" hidden>
+      <div class="seg" id="seg" role="tablist" data-i18n-aria="aria_tabs" aria-label="Plan views" style="--i:0">
+        <span class="seg-thumb" aria-hidden="true"></span>
+        <button class="seg-btn active" type="button" role="tab" id="tab-plan"
+                aria-selected="true" aria-controls="pane-plan" tabindex="0"
+                data-tab="plan" data-i18n="tab_plan">Plan</button>
+        <button class="seg-btn" type="button" role="tab" id="tab-cal"
+                aria-selected="false" aria-controls="pane-cal" tabindex="-1"
+                data-tab="cal" data-i18n="plan_section_calendar">Calendar</button>
+        <button class="seg-btn" type="button" role="tab" id="tab-kit"
+                aria-selected="false" aria-controls="pane-kit" tabindex="-1"
+                data-tab="kit" data-i18n="tab_kit">Kit</button>
+      </div>
+
+      <div class="pane-scroll" id="paneScroll">
+
+        <!-- Plan: assessment, the roadmap spine, the one task list, history -->
+        <div class="pane active" id="pane-plan" role="tabpanel" aria-labelledby="tab-plan" tabindex="0">
+          <div class="empty" id="planEmpty">
+            <div class="ghost-spine" aria-hidden="true">
+              <span class="gs-node"><i></i><u></u></span>
+              <span class="gs-node"><i></i><u></u></span>
+              <span class="gs-node"><i></i><u></u></span>
+            </div>
+            <h3 data-i18n="plan_empty_h">Your plan takes shape here</h3>
+            <p data-i18n="plan_empty_p"></p>
+          </div>
+          <div id="planContent" hidden></div>
+        </div>
+
+        <!-- Calendar: the schedule, as a week or a month -->
+        <div class="pane" id="pane-cal" role="tabpanel" aria-labelledby="tab-cal" tabindex="0">
+          <div class="cal-toolbar">
+            <button class="btn primary" type="button" id="scheduleBtn" data-i18n="btn_schedule" disabled>Schedule it</button>
+            <button class="btn" type="button" id="confirmBtn" data-i18n="btn_confirm" disabled>Confirm schedule</button>
+            <button class="btn ghost" type="button" id="icsBtn" data-i18n="btn_ics" hidden>Download .ics</button>
+            <!-- Developer instrumentation: only present with ?dev=1 -->
+            <button class="btn danger-ghost" type="button" id="rolloverBtn" hidden disabled>
+              <span data-i18n="btn_rollover">Simulate a missed day</span> <span class="demo-tag" data-i18n="demo">demo</span>
+            </button>
+          </div>
+
+          <div class="roll-note" id="rollMsg" hidden></div>
+
+          <div class="empty" id="calEmpty">
+            <h3 data-i18n="sched_none">Nothing scheduled yet</h3>
+            <p data-i18n="sched_none_p"></p>
+            <button class="btn primary empty-cta" type="button" id="emptyScheduleBtn" data-i18n="btn_schedule" disabled>Schedule it</button>
+          </div>
+
+          <div id="calContent" hidden>
+            <div class="wk-bar">
+              <div class="view-seg" id="viewSeg" role="group" data-i18n-aria="plan_section_calendar" aria-label="Calendar">
+                <button type="button" data-view="week" class="active" aria-pressed="true" data-i18n="view_week">Week</button>
+                <button type="button" data-view="month" aria-pressed="false" data-i18n="view_month">Month</button>
+              </div>
+              <div class="wk-nav">
+                <button class="wk-arrow" type="button" id="wkPrev" data-i18n-aria="aria_prev_week" aria-label="Previous week">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+                </button>
+                <span class="wk-range" id="wkRange"></span>
+                <button class="wk-arrow" type="button" id="wkNext" data-i18n-aria="aria_next_week" aria-label="Next week">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+                </button>
+                <button class="wk-today" type="button" id="wkToday" data-i18n="btn_today" data-i18n-aria="aria_today" aria-label="Go to the current week">Today</button>
+              </div>
+              <span class="wk-load" id="wkLoad"></span>
+            </div>
+
+            <div class="wk-scroll" id="calScroll">
+              <div class="wk-grid" id="wkGrid"></div>
+              <div class="mo" id="moGrid" hidden></div>
+            </div>
+            <p class="wk-hint" id="wkHint"></p>
+            <p class="wk-zone" id="wkZone"></p>
+          </div>
+        </div>
+
+        <!-- Kit: what to get, and what you are actually using -->
+        <div class="pane" id="pane-kit" role="tabpanel" aria-labelledby="tab-kit" tabindex="0">
+          <div class="empty" id="kitEmpty">
+            <h3 data-i18n="kit_empty_h">Kit guidance arrives with your plan</h3>
+            <p data-i18n="kit_empty_p"></p>
+          </div>
+          <div id="kitContent"></div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ── Conversation: an instrument, not a column. It never closes. ── -->
+    <section class="chat" id="chat" data-i18n-aria="aria_chat" aria-label="Conversation">
+      <div class="chat-body" id="chatBody">
+        <div class="chat-scroll" id="chatLog" role="log" aria-live="polite" aria-relevant="additions"></div>
+
+        <div class="tray">
+          <button class="dock-toggle" type="button" id="dockToggle" aria-expanded="true" aria-controls="chatLog">
+            <svg class="dt-open" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.6 8.6 0 0 1-3.8-.9L3 20.5l1.6-4.8A8.4 8.4 0 0 1 12 3.1a8.4 8.4 0 0 1 9 8.4z"/></svg>
+            <span class="dt-label" id="dockLabel">Ask start.ai</span>
+            <svg class="dt-close" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+          </button>
+
+          <!-- Interview progress, reported by the backend — never inferred. -->
+          <div class="tray-note" id="trayNote" hidden>
+            <span id="trayNoteText"></span>
+            <span class="tn-bar" id="trayBar" role="progressbar" hidden><i id="trayFill"></i></span>
+          </div>
+
+          <form class="composer" id="composerForm">
+            <textarea id="composerInput" rows="1" autocomplete="off" spellcheck="true"
+                      data-i18n-ph="composer" placeholder="Type your goal…"
+                      data-i18n-aria="aria_input" aria-label="Message start.ai"></textarea>
+            <button type="submit" id="sendBtn" data-i18n-aria="aria_send" aria-label="Send message" disabled>
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            </button>
+          </form>
+
+          <div class="chips" id="chips"></div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- Per-chat actions, positioned next to whichever row opened it -->
+<div class="sb-menu" id="sbMenu" role="menu" hidden>
+  <button type="button" role="menuitem" data-act="rename">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+    <span data-i18n="act_rename">Rename</span>
+  </button>
+  <button type="button" role="menuitem" class="danger" data-act="delete">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
+    <span data-i18n="act_delete">Delete</span>
+  </button>
+</div>
+
+<!-- Account menu -->
+<div class="acct-menu" id="acctMenu" role="menu" hidden>
+  <div class="am-who">
+    <span class="acct-av" id="amAv" aria-hidden="true">G</span>
+    <span class="acct-id">
+      <span class="acct-name" id="amName">Guest</span>
+      <span class="acct-plan" id="amPlan">Connected</span>
+    </span>
+  </div>
+  <div class="am-sep"></div>
+  <button type="button" role="menuitem" data-act="profile">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="10" r="3"/><path d="M6.4 19a6 6 0 0 1 11.2 0"/></svg>
+    <span data-i18n="mi_profile">Profile</span>
+  </button>
+  <button type="button" role="menuitem" data-act="appearance">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>
+    <span data-i18n="mi_personal">Personalization</span>
+  </button>
+  <button type="button" role="menuitem" data-act="settings">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.9 15.5a1.8 1.8 0 0 0 .4 2l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.8 1.8 0 0 0-3 1.3V22a2 2 0 1 1-4 0v-.2a1.8 1.8 0 0 0-3-1.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.8 1.8 0 0 0 .4-2 1.8 1.8 0 0 0-1.7-1.1H2a2 2 0 1 1 0-4h.4a1.8 1.8 0 0 0 1.7-1.1 1.8 1.8 0 0 0-.4-2l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.8 1.8 0 0 0 3-1.3V2a2 2 0 1 1 4 0v.4a1.8 1.8 0 0 0 3 1.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.8 1.8 0 0 0-.4 2 1.8 1.8 0 0 0 1.7 1.1H22a2 2 0 1 1 0 4h-.4a1.8 1.8 0 0 0-1.7 1.1z"/></svg>
+    <span data-i18n="mi_settings">Settings</span>
+  </button>
+  <div class="am-sep"></div>
+  <button type="button" role="menuitem" data-act="shortcuts">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="6" width="20" height="12" rx="2.5"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>
+    <span data-i18n="mi_shortcuts">Keyboard shortcuts</span>
+  </button>
+  <button type="button" role="menuitem" class="danger" data-act="reset">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 3h6M4 7h16M6 7l1 13h10l1-13"/><path d="M10 11v5M14 11v5"/></svg>
+    <span data-i18n="mi_reset">Reset app data</span>
+  </button>
+</div>
+
+<!-- Settings -->
+<div class="modal" id="settings" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="setTitle">
+    <header class="modal-head">
+      <h2 id="setTitle" data-i18n="set_title">Settings</h2>
+      <button class="sb-icon" type="button" id="setClose" data-i18n-aria="aria_close" aria-label="Close">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </header>
+
+    <div class="modal-body" id="setBody">
+      <section class="set-sec" id="set-profile">
+        <h3 data-i18n="set_profile">Profile</h3>
+        <label class="set-row">
+          <span data-i18n="set_name">Display name</span>
+          <input id="setName" maxlength="40" autocomplete="off" data-i18n-ph="set_name_ph" placeholder="Your name" />
+        </label>
+        <p class="set-note" data-i18n="set_name_note"></p>
+      </section>
+
+      <section class="set-sec" id="set-appearance">
+        <h3 data-i18n="set_appearance">Appearance</h3>
+        <div class="set-row">
+          <span data-i18n="set_theme">Theme</span>
+          <div class="pill-group" id="themePick" role="group" data-i18n-aria="set_theme" aria-label="Theme">
+            <button type="button" data-theme-pref="light" data-i18n="theme_light">Light</button>
+            <button type="button" data-theme-pref="dark" data-i18n="theme_dark">Dark</button>
+            <button type="button" data-theme-pref="system" data-i18n="theme_system">System</button>
+          </div>
+        </div>
+        <div class="set-row">
+          <span data-i18n="set_language">Language</span>
+          <div class="pill-group" id="langPick" role="group" data-i18n-aria="aria_lang" aria-label="Language">
+            <button type="button" data-lang="en">English</button>
+            <button type="button" data-lang="ru">Русский</button>
+            <button type="button" data-lang="uz">O‘zbekcha</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="set-sec" id="set-shortcuts">
+        <h3 data-i18n="set_shortcuts">Keyboard shortcuts</h3>
+        <ul class="kbd-list" id="kbdList"></ul>
+      </section>
+
+      <section class="set-sec" id="set-data">
+        <h3 data-i18n="set_data">Data</h3>
+        <div class="set-row">
+          <span data-i18n="set_timezone">Plan timezone</span>
+          <span class="set-val" id="setTz">—</span>
+        </div>
+        <p class="set-note" id="setTzNote"></p>
+        <p class="set-note" id="setStorage"></p>
+        <div class="set-actions">
+          <button class="btn" type="button" id="clearChatsBtn" data-i18n="set_clear">Clear all chats</button>
+          <button class="btn danger-solid" type="button" id="resetBtn" data-i18n="mi_reset">Reset app data</button>
+        </div>
+        <div class="set-confirm" id="setConfirm" hidden>
+          <p id="setConfirmText"></p>
+          <div class="set-actions">
+            <button class="btn danger-solid" type="button" id="setConfirmYes" data-i18n="set_confirm">Yes, do it</button>
+            <button class="btn" type="button" id="setConfirmNo" data-i18n="set_cancel">Cancel</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+<p class="sr-only" id="live" role="status" aria-live="polite"></p>
+
+<noscript>
+  <p style="padding:24px;font:16px system-ui">start.ai needs JavaScript to hold a conversation with the planner.</p>
+</noscript>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

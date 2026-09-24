@@ -134,6 +134,8 @@ type setupAI struct {
 	PriceRange string `json:"priceRange"`
 	Owned      bool   `json:"owned"`
 	Rationale  string `json:"rationale"`
+	// SearchQuery is optional: when empty, shop links search by Name.
+	SearchQuery string `json:"searchQuery"`
 }
 type planAI struct {
 	Assessment  string        `json:"assessment"`
@@ -163,6 +165,12 @@ type planAI struct {
 //	                a reply it never sends.
 //	plan_ready      PlanID is set and Done is true; fetch GET /api/plan/{id}
 //
+// plan_ready is NOT the end of the conversation. The same endpoint keeps
+// answering questions about the plan ("why Writing on Wednesday?", "what should
+// I do today?") and keeps accepting changes to it ("I can't do Tuesdays any
+// more"). A turn that changed something says so in PlanChanged /
+// ScheduleChanged / ChangeType, and the plan at PlanID is the updated one.
+//
 // Assistant is the full prose for the chat bubble and may carry a lead-in or a
 // skill primer. Question is the bare question for stages that ask one, so a
 // client can render it in a dedicated control without splitting strings.
@@ -175,6 +183,13 @@ type Turn struct {
 	Progress  *Progress `json:"progress,omitempty"`
 	PlanID    string    `json:"planId,omitempty"`
 	Done      bool      `json:"done"`
+
+	// Change metadata, additive and omitted when nothing happened, so an
+	// existing client is unaffected and a new one can refresh exactly what
+	// moved instead of refetching everything on every message.
+	PlanChanged     bool   `json:"planChanged,omitempty"`
+	ScheduleChanged bool   `json:"scheduleChanged,omitempty"`
+	ChangeType      string `json:"changeType,omitempty"`
 }
 
 // Progress describes how far the intake interview has got. The interview is
@@ -227,15 +242,48 @@ type feasibilityDecision struct {
 	KeepOriginal bool     `json:"keepOriginal"`
 }
 
+// Feasibility verdicts. "Reachable: yes/no" was the wrong shape: required study
+// hours are ESTIMATES with wide error bars, so a boolean forced the assistant
+// to choose between endorsing a timeline and telling someone they cannot reach
+// IELTS 7 — a claim the arithmetic never supported. These four say what is
+// actually known.
+const (
+	feasibleStatus     = "feasible"     // capacity comfortably covers the estimate
+	tightStatus        = "tight"        // capacity is close to the low estimate
+	insufficientStatus = "insufficient" // scheduled capacity falls short under current assumptions
+	unknownStatus      = "unknown"      // availability or target is not established
+)
+
+func normalizeFeasibilityStatus(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case feasibleStatus, tightStatus, insufficientStatus, unknownStatus:
+		return strings.ToLower(strings.TrimSpace(s))
+	default:
+		return unknownStatus
+	}
+}
+
 type feasibilityResult struct {
-	RequiredHours  int                 `json:"requiredHours"`
-	AvailableHours int                 `json:"availableHours"`
-	Reachable      bool                `json:"reachable"`
-	Summary        string              `json:"summary"`
-	Verdict        string              `json:"verdict"`
-	Question       string              `json:"question"`
-	Options        []feasibilityOption `json:"options"`
-	Decision       feasibilityDecision `json:"decision"`
+	// RequiredHoursLow/High are the estimate as a RANGE, because that is what
+	// it is. RequiredHours is kept for compatibility and is read as the midpoint
+	// when the range is absent.
+	RequiredHours     int `json:"requiredHours"`
+	RequiredHoursLow  int `json:"requiredHoursLow"`
+	RequiredHoursHigh int `json:"requiredHoursHigh"`
+	// AvailableHours is overwritten by the backend with its own computed
+	// capacity: the model may describe it but never decides it.
+	AvailableHours int `json:"availableHours"`
+	// Status is one of feasible|tight|insufficient|unknown.
+	Status  string `json:"status"`
+	Summary string `json:"summary"`
+	Verdict string `json:"verdict"`
+	// Projection is written by the BACKEND, never the model: when no deadline
+	// exists it states the projected finish computed from the learner's own
+	// availability, explicitly labelled as a projection.
+	Projection string              `json:"-"`
+	Question   string              `json:"question"`
+	Options    []feasibilityOption `json:"options"`
+	Decision   feasibilityDecision `json:"decision"`
 
 	// The confirmation step answers questions too — "why so many weeks?" is a
 	// fair thing to ask of a recap, and must not read as a refusal.
@@ -249,10 +297,14 @@ type Pipeline struct {
 	store *Store
 	gw    *Gateway
 	sched *Scheduler
+	// res looks up real products and courses. It starts with no providers
+	// registered, which is the honest default: see resource_providers.go. Every
+	// call through it is enrichment and every failure is survivable.
+	res *ResourceService
 }
 
 func newPipeline(cfg Config, store *Store, gw *Gateway, sched *Scheduler) *Pipeline {
-	return &Pipeline{cfg: cfg, store: store, gw: gw, sched: sched}
+	return &Pipeline{cfg: cfg, store: store, gw: gw, sched: sched, res: newResourceService()}
 }
 
 // maxIntakeQuestions bounds the interview so it always terminates. It is a
@@ -272,22 +324,31 @@ type intakeCategory struct {
 	// filled reports whether this category already has an answer, whether the
 	// user volunteered it or a previous goal put it on their profile.
 	filled func(*IntakeSession) bool
+	// maxAsks is how many times this category may be put to the user. One for
+	// almost everything: a blank answer is still an answer. timeBudget gets two
+	// because it is the one category that can be HALF answered — "Monday and
+	// Saturday" with no hours, or "5 hours a week" with no days — and a plan
+	// cannot be scheduled, or honestly assessed, on half of it.
+	maxAsks int
 }
 
 var intakeCategories = []intakeCategory{
 	{"pivotalChoice", func(s *IntakeSession) bool {
 		// Only a real category when the understand stage found a fork to resolve.
 		return s.PivotalChoice == "" || s.Answers.PivotalChoice != ""
-	}},
-	{"currentLevel", func(s *IntakeSession) bool { return s.Answers.CurrentLevel != "" }},
-	{"target", func(s *IntakeSession) bool { return s.Answers.Target != "" }},
+	}, 1},
+	{"currentLevel", func(s *IntakeSession) bool { return s.Answers.CurrentLevel != "" }, 1},
+	{"target", func(s *IntakeSession) bool { return s.Answers.Target != "" }, 1},
 	{"timeBudget", func(s *IntakeSession) bool {
-		// Hours and days are one question: "5 hours, weekends" answers both, and
-		// splitting them wastes a turn on half an availability.
-		return s.Answers.HoursPerWeek > 0 && len(s.Answers.Days) > 0
-	}},
-	{"deadline", func(s *IntakeSession) bool { return s.Answers.Deadline != "" }},
-	{"budget", func(s *IntakeSession) bool { return s.Answers.Budget != "" }},
+		// Days and time are one question: "5 hours, weekends" answers both, and
+		// splitting them wastes a turn on half an availability. But BOTH halves
+		// are required — this is the availability the whole feasibility
+		// calculation rests on, and guessing either one is what let a plan be
+		// sized against time the learner never had.
+		return currentAvailability(s).Complete()
+	}, 2},
+	{"deadline", func(s *IntakeSession) bool { return s.Answers.Deadline != "" }, 1},
+	{"budget", func(s *IntakeSession) bool { return s.Answers.Budget != "" }, 1},
 }
 
 func isIntakeCategory(key string) bool {
@@ -303,13 +364,35 @@ func isIntakeCategory(key string) bool {
 // also writes to under its own key names.
 func askedCategoryKey(key string) string { return "asked_" + key }
 
+// askCount reports how many times a category has been put to the user. The
+// marker used to be a bare "yes"; a count is stored now so timeBudget can have
+// a second attempt without any category becoming unbounded.
+func askCount(sess *IntakeSession, key string) int {
+	switch v := sess.AnswerBag[askedCategoryKey(key)]; v {
+	case "":
+		return 0
+	case "yes":
+		return 1 // the pre-existing marker shape
+	default:
+		return maxInt(1, atoi(v))
+	}
+}
+
+func categoryExhausted(sess *IntakeSession, c intakeCategory) bool {
+	limit := c.maxAsks
+	if limit <= 0 {
+		limit = 1
+	}
+	return askCount(sess, c.key) >= limit
+}
+
 // nextIntakeCategory returns what the next question must cover, or "" when the
-// interview is over. A category already put to the user is never raised again
-// even if it came back empty: "no deadline in mind" is a complete answer, and
+// interview is over. A category already put to the user is not raised again
+// beyond its allowance: "no deadline in mind" is a complete answer, and
 // re-asking would spend the whole interview on one field.
 func nextIntakeCategory(sess *IntakeSession) string {
 	for _, c := range intakeCategories {
-		if c.filled(sess) || sess.AnswerBag[askedCategoryKey(c.key)] == "yes" {
+		if c.filled(sess) || categoryExhausted(sess, c) {
 			continue
 		}
 		return c.key
@@ -323,9 +406,24 @@ var intakeCategoryMeaning = map[string]string{
 	"pivotalChoice": "which side of the fork named in pivotalChoice they want",
 	"currentLevel":  "where they are with this skill today, concretely",
 	"target":        "the specific outcome they want to reach",
-	"timeBudget":    "how many hours per week AND which days of the week — one question covering both",
+	"timeBudget":    "which days of the week they can study AND how much time — one question covering both",
 	"deadline":      "the date they want to be done by",
 	"budget":        "how much money they can put into this",
+}
+
+// timeBudgetMeaning narrows the availability question to whichever half is
+// still missing. Asking "how many hours and which days?" of someone who has
+// already said "Monday and Saturday" is the kind of redundancy that makes an
+// assistant feel like a form.
+func timeBudgetMeaning(sess *IntakeSession) string {
+	switch missingAvailability(sess.Answers.Availability) {
+	case "days":
+		return "which days of the week they can study — they have already told you how much time, so do NOT ask about hours again"
+	case "time":
+		return "how much time they can study on those days (per day or per week) — they have already told you which days, so do NOT ask which days again"
+	default:
+		return intakeCategoryMeaning["timeBudget"]
+	}
 }
 
 // remainingCategories lists what is still outstanding after askAbout, so a
@@ -338,7 +436,7 @@ func remainingCategories(sess *IntakeSession, askAbout string) []string {
 			seen = true
 			continue
 		}
-		if !seen || c.filled(sess) || sess.AnswerBag[askedCategoryKey(c.key)] == "yes" {
+		if !seen || c.filled(sess) || categoryExhausted(sess, c) {
 			continue
 		}
 		out = append(out, c.key)
@@ -353,7 +451,7 @@ func markCategoryAsked(sess *IntakeSession, key string) {
 	if sess.AnswerBag == nil {
 		sess.AnswerBag = map[string]string{}
 	}
-	sess.AnswerBag[askedCategoryKey(key)] = "yes"
+	sess.AnswerBag[askedCategoryKey(key)] = itoa(askCount(sess, key) + 1)
 }
 
 // ---- prompt context ----
@@ -365,34 +463,16 @@ func markCategoryAsked(sess *IntakeSession, key string) {
 // JSON payload each stage documents, and because the gateway keys its cache on
 // that payload, richer context also means a correctly narrower cache.
 
-// promptHistoryTurns caps how much transcript a stage receives: enough for the
-// model to recall what it already asked, short enough to keep both the token
-// bill and the cache key bounded. Four is two exchanges — which is all the
-// "did I already ask this?" checks need, since the categories the interview
-// still owes are passed explicitly. Every extra turn is paid for on every
-// call, and the daily token allowance is what a long conversation runs out of
-// first.
-const promptHistoryTurns = 4
-
+// promptMessage is one turn as a stage sends it to the provider.
+//
+// The transcript is no longer pasted into the stage payload. It is replayed as
+// real user/assistant messages (see conversation.go), bounded by both a turn
+// count and a character budget, and it never contains the message currently
+// being handled — that travels alone in <current_user_message>. The old
+// behaviour sent both, so the newest user message arrived twice.
 type promptMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
-}
-
-// recentTurns renders the tail of the conversation, oldest first. The latest
-// user message is already appended by HandleChat, so it appears here as well as
-// in the stage's own "latest" field — a duplicate costs a few tokens and is far
-// safer than an off-by-one that hides the message the model must answer.
-func recentTurns(sess *IntakeSession) []promptMessage {
-	msgs := sess.Messages
-	if len(msgs) > promptHistoryTurns {
-		msgs = msgs[len(msgs)-promptHistoryTurns:]
-	}
-	out := make([]promptMessage, 0, len(msgs))
-	for _, m := range msgs {
-		out = append(out, promptMessage{Role: m.Role, Content: m.Content})
-	}
-	return out
 }
 
 // sessionUser returns the session's stored profile (nil when absent) and the
@@ -405,33 +485,39 @@ func (p *Pipeline) sessionUser(sess *IntakeSession) (*User, *time.Location) {
 	return u, loadLocation(u.Timezone)
 }
 
-// planAvailability resolves the weekly budget the plan is built against. The
-// plan prompt and materializePlan must agree on it exactly: telling the model a
-// budget the scheduler then ignores is how todos end up silently dropped.
-func planAvailability(sess *IntakeSession) (hours int, days []string) {
-	hours = sess.Answers.HoursPerWeek
-	if hours <= 0 {
-		hours = defaultHoursWeek
+// planAvailability resolves the weekly budget the plan is built against, and —
+// critically — says whether it was actually told or merely assumed.
+//
+// The scheduler must always be handed something placeable, so a fallback still
+// exists. What changed is that the fallback is no longer invisible: assumed ==
+// true means nobody chose these numbers, and the confirmation gate refuses to
+// present feasibility arithmetic computed from them. Treating the default six
+// hours as a fact is half of how a deadline turned into a capacity estimate.
+func planAvailability(sess *IntakeSession) (av StudyAvailability, assumed bool) {
+	av = currentAvailability(sess)
+	if av.Complete() {
+		return av, false
 	}
-	days = sess.Answers.Days
-	if len(days) == 0 {
-		days = []string{"Mon", "Wed", "Fri"}
+	if !av.HasDays() {
+		av.Days = []string{"Mon", "Wed", "Fri"}
 	}
-	return hours, days
+	if !av.HasTime() {
+		av.WeeklyMinutes = defaultHoursWeek * 60
+	}
+	av.normalize()
+	return av, true
 }
 
 func (p *Pipeline) buildUnderstandContext(sess *IntakeSession, msg string) string {
 	_, loc := p.sessionUser(sess)
 	b, _ := json.Marshal(map[string]any{
-		"today":          dateStr(todayIn(loc)),
-		"latestMessage":  msg,
-		"recentMessages": recentTurns(sess),
-		"knownSkill":     sess.Skill,
+		"today":      dateStr(todayIn(loc)),
+		"knownSkill": sess.Skill,
 	})
 	return string(b)
 }
 
-func (p *Pipeline) buildIntakeContext(sess *IntakeSession, latest, askAbout string) string {
+func (p *Pipeline) buildIntakeContext(sess *IntakeSession, askAbout string) string {
 	u, loc := p.sessionUser(sess)
 	profile := map[string]any{"hoursPerWeek": 0, "days": []string{}, "timezone": ""}
 	if u != nil {
@@ -444,6 +530,13 @@ func (p *Pipeline) buildIntakeContext(sess *IntakeSession, latest, askAbout stri
 		}
 		profile["timezone"] = u.Timezone
 	}
+	meaning := map[string]string{}
+	for k, v := range intakeCategoryMeaning {
+		meaning[k] = v
+	}
+	meaning["timeBudget"] = timeBudgetMeaning(sess)
+
+	av := currentAvailability(sess)
 	b, _ := json.Marshal(map[string]any{
 		"today":         dateStr(todayIn(loc)),
 		"skill":         sess.Skill,
@@ -451,17 +544,23 @@ func (p *Pipeline) buildIntakeContext(sess *IntakeSession, latest, askAbout stri
 		"pivotalChoice": sess.PivotalChoice,
 		"knownAnswers":  sess.Answers,
 		"profile":       profile,
+		// Availability, spelled out, so the model can see which half it already
+		// has and never asks for it twice.
+		"availability": map[string]any{
+			"days":          av.Days,
+			"weeklyMinutes": av.WeeklyMinutes,
+			"perDay":        av.PerDay,
+			"missing":       missingAvailability(av),
+		},
 		// The backend's choice of subject for this turn, and what is still
 		// outstanding after it, so a reply that answers ahead can skip forward.
 		"askAbout":        askAbout,
 		"askCategories":   append([]string{askAbout}, remainingCategories(sess, askAbout)...),
-		"categoryMeaning": intakeCategoryMeaning,
+		"categoryMeaning": meaning,
 		// The interview is cut off at maxIntakeQuestions whatever the model
 		// wants, so it has to know how much room is left to spend.
 		"questionsAsked":     sess.AskedCount,
 		"questionsRemaining": maxInt(0, maxIntakeQuestions-sess.AskedCount),
-		"recentMessages":     recentTurns(sess),
-		"latestReply":        latest,
 	})
 	return string(b)
 }
@@ -469,60 +568,178 @@ func (p *Pipeline) buildIntakeContext(sess *IntakeSession, latest, askAbout stri
 // planHorizon resolves the schedule arithmetic both the feasibility gate and
 // the plan stage reason about, from one place so the two can never disagree
 // about how much time the user actually has.
-func planHorizon(sess *IntakeSession, loc *time.Location) (start time.Time, hours int, days []string, weeksUntilDeadline int) {
-	hours, days = planAvailability(sess)
-	start = todayIn(loc).AddDate(0, 0, 1) // same first day materializePlan uses
-	if d, ok := parseDateIn(sess.Answers.Deadline, loc); ok {
-		if n := daysBetween(start, d); n > 0 {
-			weeksUntilDeadline = (n + 6) / 7 // whole weeks, rounded up
-		}
-	}
-	return start, hours, days, weeksUntilDeadline
+//
+// THE CAPACITY RULE. studyHours is computed by walking the learner's own
+// availability across the calendar (availableStudyMinutes), NOT from the span
+// to the deadline. A deadline ten weeks out at three hours a week is thirty
+// study hours; it is not 10 x 7 x 24, and it is not ten weeks of a default
+// nobody chose. capacityKnown is false whenever the availability was assumed,
+// and every consumer is required to treat that as "unknown", not as zero and
+// not as a number to reason from.
+type horizon struct {
+	Start        time.Time
+	Availability StudyAvailability
+	Assumed      bool
+	// HasDeadline is whether the LEARNER gave one. A projected finish date is
+	// not a deadline and never sets this.
+	HasDeadline        bool
+	Deadline           time.Time
+	WeeksUntilDeadline int
+	StudyMinutes       int
+	CapacityKnown      bool
+	PlanWeeks          int
 }
 
-func (p *Pipeline) buildFeasibilityContext(sess *IntakeSession, loc *time.Location, latest string) string {
-	_, hours, days, weeksUntilDeadline := planHorizon(sess, loc)
+func planHorizon(sess *IntakeSession, loc *time.Location) horizon {
+	h := horizon{}
+	h.Availability, h.Assumed = planAvailability(sess)
+	h.Start = todayIn(loc).AddDate(0, 0, 1) // same first day materializePlan uses
+
+	if d, ok := parseDateIn(sess.Answers.Deadline, loc); ok {
+		h.HasDeadline = true
+		h.Deadline = d
+		if n := daysBetween(h.Start, d); n > 0 {
+			h.WeeksUntilDeadline = (n + 6) / 7 // whole weeks, rounded up
+		}
+		if !h.Assumed {
+			h.StudyMinutes, h.CapacityKnown = availableStudyMinutes(h.Availability, h.Start, d)
+		}
+	}
+	// NO fallback horizon. "Study time available before your deadline" is
+	// meaningless without a deadline, and computing it against maxPlanWeeks
+	// invented one: fifty-two weeks at two hours produced the "103 available
+	// hours" a learner was shown who had never given a date at all. Without a
+	// deadline, capacity stays unknown and a PROJECTED FINISH is offered
+	// instead — see projectionLine.
+
+	h.PlanWeeks = maxPlanWeeks
+	if h.WeeksUntilDeadline > 0 {
+		h.PlanWeeks = minInt(h.WeeksUntilDeadline, maxPlanWeeks)
+	}
+	return h
+}
+
+// projectedWeeks is how long a workload takes at the learner's own rate.
+// Deterministic: the model supplies the workload estimate, the backend does the
+// division. Zero when either side is unknown.
+func projectedWeeks(requiredHours int, av StudyAvailability) int {
+	if requiredHours <= 0 || !av.Complete() {
+		return 0
+	}
+	weeks := (requiredHours*60 + av.WeeklyMinutes - 1) / av.WeeklyMinutes
+	return maxInt(1, weeks)
+}
+
+// projectionLine is the backend's own sentence about when a plan would finish
+// when no deadline exists.
+//
+// It is labelled as a projection every time. A date start.ai worked out from an
+// estimate is not a commitment the learner made, and presenting one as
+// "Deadline: <date>" would put words in their mouth.
+func projectionLine(lang string, h horizon, lowHours, highHours int) string {
+	if h.HasDeadline || h.Assumed || !h.Availability.Complete() {
+		return ""
+	}
+	lo, hi := projectedWeeks(lowHours, h.Availability), projectedWeeks(highHours, h.Availability)
+	if lo == 0 && hi == 0 {
+		return ""
+	}
+	if lo == 0 {
+		lo = hi
+	}
+	if hi == 0 {
+		hi = lo
+	}
+	if hi < lo {
+		lo, hi = hi, lo
+	}
+	hours := itoa(h.Availability.HoursPerWeek())
+	from := dateStr(h.Start.AddDate(0, 0, lo*7))
+	to := dateStr(h.Start.AddDate(0, 0, hi*7))
+	span := itoa(lo) + "–" + itoa(hi)
+	if lo == hi {
+		span = itoa(lo)
+	}
+	return tr(lang,
+		"You haven't set a deadline, so there's nothing to fall short of. At about "+hours+"h a week that works out at roughly "+span+" weeks — a projected finish around "+from+" to "+to+". That's an estimate from your availability, not a date you've committed to.",
+		"Вы не указали срок, поэтому и отставать не от чего. При примерно "+hours+" ч в неделю это около "+span+" недель — ориентировочное завершение между "+from+" и "+to+". Это оценка по вашей доступности, а не дата, которую вы назначили.",
+		"Siz muddat belgilamagansiz, shuning uchun kechikadigan narsa ham yo'q. Haftasiga taxminan "+hours+" soat bilan bu taxminan "+span+" hafta — taxminiy tugash "+from+" va "+to+" oralig'ida. Bu sizning imkoniyatingizdan chiqarilgan taxmin, o'zingiz belgilagan sana emas.")
+}
+
+// studyHours renders the capacity as whole hours, or -1 when it is unknown.
+// -1 rather than 0 because zero is a real answer ("your deadline is tomorrow")
+// and must not be confused with "we have not asked yet".
+func (h horizon) studyHours() int {
+	if !h.CapacityKnown {
+		return -1
+	}
+	return h.StudyMinutes / 60
+}
+
+func (p *Pipeline) buildFeasibilityContext(sess *IntakeSession, loc *time.Location) string {
+	h := planHorizon(sess, loc)
+	av := h.Availability
 	b, _ := json.Marshal(map[string]any{
-		"today":               dateStr(todayIn(loc)),
-		"skill":               sess.Skill,
-		"path":                sess.Path,
-		"currentLevel":        sess.Answers.CurrentLevel,
-		"target":              sess.Answers.Target,
-		"deadline":            sess.Answers.Deadline,
-		"hoursPerWeek":        hours,
-		"days":                days,
-		"weeksUntilDeadline":  weeksUntilDeadline,
-		"totalHoursAvailable": weeksUntilDeadline * hours,
-		"maxWeeks":            maxPlanWeeks,
+		"today":        dateStr(todayIn(loc)),
+		"skill":        sess.Skill,
+		"path":         sess.Path,
+		"currentLevel": sess.Answers.CurrentLevel,
+		"target":       sess.Answers.Target,
+		"deadline":     sess.Answers.Deadline,
+
+		// Availability, as stated by the learner.
+		"days":          av.Days,
+		"weeklyMinutes": av.WeeklyMinutes,
+		"hoursPerWeek":  av.HoursPerWeek(),
+		"perDay":        av.PerDay,
+
+		"weeksUntilDeadline": h.WeeksUntilDeadline,
+		"maxWeeks":           maxPlanWeeks,
+
+		// hasDeadline is whether the LEARNER gave one. When it is false there
+		// is no date to be early or late for, so nothing may be described as
+		// insufficient "before the deadline" and no option may propose moving
+		// one. A projected finish is offered instead, and the backend writes it.
+		"hasDeadline": h.HasDeadline,
+
+		// The ONLY capacity figure. It is the sum of the learner's own
+		// schedulable minutes between the start date and the deadline.
+		// capacityKnown=false means availability or the deadline is missing and
+		// no feasibility claim of any kind may be made.
+		"availableStudyHours": h.studyHours(),
+		"capacityKnown":       h.CapacityKnown,
+
 		// The full answer set, so the recap can be checked against everything
 		// the user actually said rather than the handful of scheduling fields.
-		"answers":        sess.Answers,
-		"planNotes":      sess.PlanNotes,
-		"recentMessages": recentTurns(sess),
-		"latestReply":    latest,
+		"answers":   sess.Answers,
+		"planNotes": sess.PlanNotes,
 	})
 	return string(b)
 }
 
 func (p *Pipeline) buildPlanContext(sess *IntakeSession, loc *time.Location) string {
-	start, hours, days, weeksUntilDeadline := planHorizon(sess, loc)
+	h := planHorizon(sess, loc)
+	av := h.Availability
 
 	b, _ := json.Marshal(map[string]any{
 		"today":              dateStr(todayIn(loc)),
-		"startDate":          dateStr(start),
+		"startDate":          dateStr(h.Start),
 		"skill":              sess.Skill,
 		"path":               sess.Path,
 		"answers":            sess.Answers,
-		"weeklyMinuteBudget": hours * 60,
-		"hoursPerWeek":       hours,
-		"days":               days,
-		"daysAvailable":      len(days),
+		"weeklyMinuteBudget": av.WeeklyMinutes,
+		"hoursPerWeek":       av.HoursPerWeek(),
+		"days":               av.Days,
+		"daysAvailable":      len(av.Days),
+		"perDay":             av.PerDay,
 		"deadline":           sess.Answers.Deadline,
-		"weeksUntilDeadline": weeksUntilDeadline,
-		// The total study hours the deadline actually buys. Handing the model
-		// the finished number is what lets it check a target against reality
-		// instead of calling every timeline "achievable". 0 means no deadline.
-		"totalHoursAvailable": weeksUntilDeadline * hours,
+		"weeksUntilDeadline": h.WeeksUntilDeadline,
+		// The study hours the learner's OWN availability yields before the
+		// deadline. Handing the model the finished number is what lets it check
+		// a target against reality instead of calling every timeline
+		// "achievable". -1 means availability is unknown, not zero.
+		"availableStudyHours": h.studyHours(),
+		"capacityKnown":       h.CapacityKnown,
 		"maxWeeks":            maxPlanWeeks,
 		// The verdict the user was shown and approved at the confirmation gate.
 		// The plan must be built for what was agreed, and its own feasibility
@@ -541,14 +758,19 @@ func (p *Pipeline) buildPlanContext(sess *IntakeSession, loc *time.Location) str
 // sequential, and without that serialization concurrent turns lose AskedCount
 // increments and can build two plans for one session.
 func (p *Pipeline) HandleChat(ctx context.Context, sess *IntakeSession, userMsg string) (Turn, error) {
-	sess.Messages = append(sess.Messages, Message{Role: "user", Content: userMsg, At: time.Now()})
 	if sess.Stage == "" {
 		sess.Stage = "scope_check"
 	}
+	// Record what the user said BEFORE doing any work, exactly once. Every
+	// stage reads history through conversationWindow, which excludes this
+	// message and passes it separately, so an internal retry or a fallback to
+	// another model cannot append it a second time.
+	entryStage := sess.Stage
+	appendUserMessage(sess, userMsg, entryStage)
 
 	var turn Turn
 	var err error
-	switch sess.Stage {
+	switch entryStage {
 	case "scope_check", "out_of_scope":
 		turn, err = p.doUnderstand(ctx, sess, userMsg)
 	case "disambiguation":
@@ -558,21 +780,22 @@ func (p *Pipeline) HandleChat(ctx context.Context, sess *IntakeSession, userMsg 
 	case "confirm_plan":
 		turn, err = p.doConfirm(ctx, sess, userMsg)
 	case "plan_ready":
-		turn = Turn{Stage: sess.Stage, PlanID: sess.PlanID, Assistant: tr(sess.Lang,
-			"Your plan is ready — open it on the right, or say a new goal to start another.",
-			"Ваш план готов — откройте его справа или назовите новую цель, чтобы начать другой.",
-			"Rejangiz tayyor — uni o'ng tomondan oching yoki boshqasini boshlash uchun yangi maqsad ayting.")}
+		// A finished plan is the START of the relationship, not the end of it.
+		turn, err = p.doAssist(ctx, sess, userMsg)
 	default:
 		turn, err = p.doUnderstand(ctx, sess, userMsg)
 	}
 	if err != nil {
+		// A failed turn records NO assistant message: inventing a successful
+		// reply that was never produced would poison every later turn's memory.
+		// The user message stays — they really did say it — and the session is
+		// persisted so a retry sees the same history rather than a fresh one.
+		p.store.SaveSession(sess)
 		return Turn{}, err
 	}
 
 	turn.SessionID = sess.ID
-	if turn.Assistant != "" {
-		sess.Messages = append(sess.Messages, Message{Role: "assistant", Content: turn.Assistant, At: time.Now()})
-	}
+	appendAssistantMessage(sess, turn.Assistant, turn.Stage)
 	p.store.SaveSession(sess)
 	return turn, nil
 }
@@ -581,7 +804,11 @@ func (p *Pipeline) doUnderstand(ctx context.Context, sess *IntakeSession, msg st
 	var u understandResult
 	if p.gw.Enabled() {
 		payload := p.buildUnderstandContext(sess, msg)
-		raw, err := p.gw.Chat(ctx, sess.UserID, p.cfg.ModelFast, withLang(prompts["understand"].System, sess.Lang), payload, true, cacheKeyFor("understand", sess.Lang, payload))
+		history := conversationWindow(sess)
+		turns := stageTurns(prompts["understand"].System, sess.Lang, history, payload, msg,
+			"Classify the current user message: is it a learning goal, does it need narrowing, and what is the skill?")
+		raw, err := p.gw.ChatTurns(ctx, sess.UserID, p.cfg.ModelFast, turns, true,
+			cacheKeyForTurns("understand", sess.Lang, payload+"\x00"+msg, history))
 		if err != nil {
 			return Turn{}, err
 		}
@@ -699,17 +926,55 @@ func (p *Pipeline) doIntake(ctx context.Context, sess *IntakeSession, msg string
 // numbers do not support the goal, the alternatives come with it.
 
 // gateBeforePlan presents the recap and waits. It never plans on its own.
+//
+// It also refuses to present arithmetic it cannot support. Availability is the
+// input the entire feasibility calculation rests on, so if it is still missing
+// the gate sends the interview back for it rather than quietly substituting a
+// default and showing the user a capacity nobody ever stated. The interview
+// ceiling still applies: once it is spent the plan is built on an explicitly
+// assumed availability and the verdict says "unknown" rather than pretending.
 func (p *Pipeline) gateBeforePlan(ctx context.Context, sess *IntakeSession) (Turn, error) {
 	if sess.FeasibilityAgreed {
 		return p.finishIntakeAndPlan(ctx, sess)
+	}
+	if !currentAvailability(sess).Complete() && sess.AskedCount < maxIntakeQuestions {
+		if turn, asked, err := p.askForAvailability(ctx, sess); asked || err != nil {
+			return turn, err
+		}
 	}
 	r, err := p.confirmBeforePlan(ctx, sess, "")
 	if err != nil {
 		return Turn{}, err
 	}
 	sess.FeasibilityNote = r.Verdict
+	sess.FeasibilityStatus = normalizeFeasibilityStatus(r.Status)
 	sess.Stage = "confirm_plan"
 	return confirmTurn(sess, r), nil
+}
+
+// askForAvailability puts the missing half of the availability question and
+// keeps the conversation in the intake stage. It returns asked=false when the
+// category has already had its allowance, so this can never loop.
+func (p *Pipeline) askForAvailability(ctx context.Context, sess *IntakeSession) (Turn, bool, error) {
+	for _, c := range intakeCategories {
+		if c.key != "timeBudget" {
+			continue
+		}
+		if categoryExhausted(sess, c) {
+			return Turn{}, false, nil
+		}
+	}
+	sess.Stage = "intake"
+	r, err := p.nextIntake(ctx, sess, "", false)
+	if err != nil {
+		return Turn{}, false, err
+	}
+	if r.Done || strings.TrimSpace(r.NextQuestion) == "" {
+		// The stage decided nothing is outstanding after all.
+		return Turn{}, false, nil
+	}
+	sess.AskedCount++
+	return p.intakeTurn(sess, withReply(r.ReplyToUser, r.NextQuestion), r.NextQuestion, r.Options), true, nil
 }
 
 // doConfirm handles the user's answer to the recap: go ahead, change something,
@@ -722,14 +987,14 @@ func (p *Pipeline) doConfirm(ctx context.Context, sess *IntakeSession, msg strin
 	if note := strings.TrimSpace(r.NoteForPlan); note != "" {
 		sess.PlanNotes = appendNote(sess.PlanNotes, note)
 	}
-	sess.FeasibilityNote = firstNonEmpty(r.Verdict, sess.FeasibilityNote)
+	applyConfirmOutcome(sess, r)
 
 	// An adjustment they asked for is applied whether or not they also approved,
 	// so "make it 10 hours a week, go ahead" does both in one message.
 	changed := false
 	if r.Decision.Resolved && !r.Decision.KeepOriginal {
 		before := answersFingerprint(sess)
-		applyFeasibilityDecision(sess, r.Decision)
+		applyFeasibilityDecision(sess, r.Decision, msg)
 		changed = before != answersFingerprint(sess)
 	}
 
@@ -747,7 +1012,7 @@ func (p *Pipeline) doConfirm(ctx context.Context, sess *IntakeSession, msg strin
 				return Turn{}, err
 			}
 			fresh.ReplyToUser = firstNonEmpty(r.ReplyToUser, fresh.ReplyToUser)
-			sess.FeasibilityNote = firstNonEmpty(fresh.Verdict, sess.FeasibilityNote)
+			applyConfirmOutcome(sess, fresh)
 			return confirmTurn(sess, fresh), nil
 		}
 		return confirmTurn(sess, r), nil
@@ -778,7 +1043,7 @@ func confirmTurn(sess *IntakeSession, r feasibilityResult) Turn {
 			"Shu asosda rejangizni tuzaymi?")
 	}
 	parts := []string{}
-	for _, s := range []string{r.ReplyToUser, r.Summary, r.Verdict, question} {
+	for _, s := range []string{r.ReplyToUser, r.Summary, r.Verdict, r.Projection, question} {
 		if s = strings.TrimSpace(s); s != "" {
 			parts = append(parts, s)
 		}
@@ -794,7 +1059,21 @@ func confirmTurn(sess *IntakeSession, r feasibilityResult) Turn {
 // applyFeasibilityDecision writes the agreed goal back over the intake answers,
 // validating exactly as applyAnswers does so a bad date or a silly number of
 // hours cannot enter through this door instead.
-func applyFeasibilityDecision(sess *IntakeSession, d feasibilityDecision) {
+// applyFeasibilityDecision writes an agreed change back over the intake answers.
+//
+// userMsg is the learner's own message for this turn, and it gates the
+// availability half: the decision may only move the study week when the learner
+// actually said something about their study week. The confirm prompt asks for
+// the COMPLETE resulting set on every decision, including approvals, so a model
+// that re-reads an older recap out of the transcript will cheerfully "confirm"
+// the numbers the learner already replaced. That is how a recap showing 14h/week
+// across seven days was approved and then built as two hours on Mondays.
+//
+// Target and deadline are applied from the decision as before: an option like
+// "Lower the target to basic syntax" carries no numbers for a parser to find,
+// and getting those wrong is visible in the next recap rather than silently
+// baked into a year of calendar.
+func applyFeasibilityDecision(sess *IntakeSession, d feasibilityDecision, userMsg string) {
 	a := &sess.Answers
 	if v := strings.TrimSpace(d.Target); v != "" {
 		a.Target = v
@@ -802,27 +1081,51 @@ func applyFeasibilityDecision(sess *IntakeSession, d feasibilityDecision) {
 	if v := strings.TrimSpace(d.Deadline); validDate(v) {
 		a.Deadline = v
 	}
-	if d.HoursPerWeek > 0 {
-		a.HoursPerWeek = clamp(d.HoursPerWeek, 1, 40)
+
+	// Did the learner state an availability in this message? Option labels go
+	// through this same path rather than a parser of their own, so selecting
+	// "Increase study time to 35 hours per week (5 h/day)" mutates state
+	// exactly as typing it would.
+	st := parseAvailabilityStatement(userMsg)
+	if st.empty() {
+		return
 	}
-	// Run through detectDays exactly as applyAnswers does, so "Monday, Tuesday
-	// and Friday" becomes the canonical codes the scheduler matches on and a
-	// name it cannot parse changes nothing rather than emptying the week.
-	if len(d.Days) > 0 {
-		if days := detectDays(strings.Join(d.Days, ",")); len(days) > 0 {
-			a.Days = days
-		}
+
+	// Their words first, resolved against the week in force; the decision may
+	// only fill a half those words left unread. Everything goes through the
+	// same normalization as an interview answer, so an unparseable day name
+	// changes nothing rather than emptying the week, and a silly number of
+	// hours is clamped.
+	// allowBareNumber is false here on purpose: the gate never asks "how many
+	// hours?", so a lone digit in a message at this point belongs to something
+	// else — a target, a band score, an option number.
+	next := resolveAvailability(currentAvailability(sess), st, false)
+	var fill StudyAvailability
+	if !next.HasDays() && len(d.Days) > 0 {
+		fill.Days = detectDays(strings.Join(d.Days, ","))
 	}
+	if !next.HasTime() && d.HoursPerWeek > 0 {
+		fill.WeeklyMinutes = clamp(d.HoursPerWeek, 1, 40) * 60
+	}
+	fill.normalize()
+	if fill.HasDays() || fill.HasTime() {
+		next = mergeAvailability(next, fill)
+	}
+	syncAnswersAvailability(sess, next)
 }
 
 func (p *Pipeline) confirmBeforePlan(ctx context.Context, sess *IntakeSession, latest string) (feasibilityResult, error) {
 	_, loc := p.sessionUser(sess)
+	h := planHorizon(sess, loc)
 	if !p.gw.Enabled() {
-		_, hours, _, weeks := planHorizon(sess, loc)
-		return mockConfirm(sess, weeks*hours, latest), nil
+		return mockConfirm(sess, h, latest), nil
 	}
-	payload := p.buildFeasibilityContext(sess, loc, latest)
-	raw, err := p.gw.Chat(ctx, sess.UserID, p.cfg.ModelSmart, withLang(prompts["confirm"].System, sess.Lang), payload, true, cacheKeyFor("confirm", sess.Lang, payload))
+	payload := p.buildFeasibilityContext(sess, loc)
+	history := conversationWindow(sess)
+	task := "Recap what you understood, state the capacity arithmetic honestly, and ask whether to build the plan. Read the current user message as their answer if there is one."
+	turns := stageTurns(prompts["confirm"].System, sess.Lang, history, payload, latest, task)
+	raw, err := p.gw.ChatTurns(ctx, sess.UserID, p.cfg.ModelSmart, turns, true,
+		cacheKeyForTurns("confirm", sess.Lang, payload+"\x00"+latest, history))
 	if err != nil {
 		return feasibilityResult{}, err
 	}
@@ -830,12 +1133,31 @@ func (p *Pipeline) confirmBeforePlan(ctx context.Context, sess *IntakeSession, l
 	if e := json.Unmarshal([]byte(extractJSONObject(raw)), &r); e != nil {
 		return feasibilityResult{}, fmt.Errorf("%w: confirm stage returned unparsable JSON: %v", errAIUnavailable, e)
 	}
+	// The capacity figure is the backend's, always. The model can describe it;
+	// it does not get to restate it, round it, or derive one of its own from
+	// the deadline.
+	r.AvailableHours = h.studyHours()
+	r.Status = normalizeFeasibilityStatus(r.Status)
+	if !h.CapacityKnown {
+		r.Status = unknownStatus
+	}
+	// Without a deadline there is nothing to fall short of, so the backend
+	// replaces any shortfall verdict with its own projected finish.
+	r.Projection = projectionLine(sess.Lang, h, r.RequiredHoursLow, r.RequiredHoursHigh)
 	// A recap with nothing to read and nothing to answer would strand the
 	// conversation, since the gate will not let a plan through without approval.
 	if !r.Decision.Approved && strings.TrimSpace(r.Summary) == "" && strings.TrimSpace(r.Verdict) == "" && strings.TrimSpace(r.ReplyToUser) == "" {
 		return feasibilityResult{}, fmt.Errorf("%w: confirm stage returned nothing to show the user", errAIUnavailable)
 	}
 	return r, nil
+}
+
+// applyConfirmOutcome records the agreed verdict on the session.
+func applyConfirmOutcome(sess *IntakeSession, r feasibilityResult) {
+	sess.FeasibilityNote = firstNonEmpty(r.Verdict, sess.FeasibilityNote)
+	if s := normalizeFeasibilityStatus(r.Status); s != unknownStatus || sess.FeasibilityStatus == "" {
+		sess.FeasibilityStatus = s
+	}
 }
 
 // nextIntake runs one adaptive intake step, real or mock. In live mode every
@@ -859,8 +1181,12 @@ func (p *Pipeline) nextIntake(ctx context.Context, sess *IntakeSession, latest s
 		return mockIntake(sess, latest), nil
 	}
 	askAbout := nextIntakeCategory(sess)
-	payload := p.buildIntakeContext(sess, latest, askAbout)
-	raw, err := p.gw.Chat(ctx, sess.UserID, p.cfg.ModelFast, withLang(prompts["intake"].System, sess.Lang), payload, true, cacheKeyFor("intake", sess.Lang, payload))
+	payload := p.buildIntakeContext(sess, askAbout)
+	history := conversationWindow(sess)
+	task := "Merge the current user message into the answers, then ask about the first outstanding category in askCategories. Do not choose a topic of your own."
+	turns := stageTurns(prompts["intake"].System, sess.Lang, history, payload, latest, task)
+	raw, err := p.gw.ChatTurns(ctx, sess.UserID, p.cfg.ModelFast, turns, true,
+		cacheKeyForTurns("intake", sess.Lang, payload+"\x00"+latest, history))
 	if err != nil {
 		return intakeResult{}, err
 	}
@@ -869,6 +1195,14 @@ func (p *Pipeline) nextIntake(ctx context.Context, sess *IntakeSession, latest s
 		return intakeResult{}, fmt.Errorf("%w: intake stage returned unparsable JSON: %v", errAIUnavailable, e)
 	}
 	applyAnswers(sess, r.Answers)
+	// The model reads language and intent; the backend does the arithmetic.
+	// "Mon, Wed and Fri, an hour each" is exactly 180 minutes a week, and
+	// deriving that here rather than trusting a model to add up three numbers
+	// is what makes the availability — and therefore the whole feasibility
+	// calculation — reproducible.
+	if !r.LatestWasQuestion {
+		recordStatedAvailability(sess, latest, askAbout, r.Answers)
+	}
 	if note := strings.TrimSpace(r.NoteForPlan); note != "" {
 		sess.PlanNotes = appendNote(sess.PlanNotes, note)
 	}
@@ -939,16 +1273,118 @@ func applyAnswers(sess *IntakeSession, m map[string]string) {
 			a.Deadline = d
 		}
 	}
-	if v := strings.TrimSpace(m["hoursPerWeek"]); v != "" {
-		if n, ok := parseHoursPerWeek(v); ok {
-			a.HoursPerWeek = n
-		}
+	// Availability is deliberately NOT applied here — see recordStatedAvailability.
+}
+
+// availabilityFromModel decodes the availability the model reported. It is a
+// CLAIM, not a fact: nothing here reaches the session until the user's own
+// words have been shown to contain an availability.
+func availabilityFromModel(m map[string]string) StudyAvailability {
+	var add StudyAvailability
+	if m == nil {
+		return add
 	}
 	if v := strings.TrimSpace(m["days"]); v != "" {
-		if days := detectDays(v); len(days) > 0 {
-			a.Days = days
+		add.Days = detectDays(v)
+	}
+	if v := strings.TrimSpace(m["hoursPerWeek"]); v != "" {
+		if n, ok := parseHoursPerWeek(v); ok {
+			add.WeeklyMinutes = n * 60
 		}
 	}
+	if v := strings.TrimSpace(m["weeklyMinutes"]); v != "" {
+		if n, ok := parseInt(v); ok && n > 0 {
+			add.WeeklyMinutes = n
+		}
+	}
+	// perDay arrives as "Mon:60,Wed:60,Fri:90" — the answerMap decoder has
+	// already flattened whatever shape the model used into a scalar string.
+	if v := strings.TrimSpace(m["perDay"]); v != "" {
+		for _, part := range strings.Split(v, ",") {
+			bits := strings.SplitN(strings.TrimSpace(part), ":", 2)
+			if len(bits) != 2 {
+				continue
+			}
+			codes := detectDays(bits[0])
+			mins, ok := parseInt(bits[1])
+			if len(codes) == 0 || !ok || mins <= 0 {
+				continue
+			}
+			add.PerDay = append(add.PerDay, DayAvailability{Weekday: codes[0], Minutes: mins})
+		}
+	}
+	add.normalize()
+	return add
+}
+
+// recordStatedAvailability is the ONLY way an availability enters the session
+// during the interview.
+//
+// The rule is: availability comes from the learner's own words. The model may
+// finish a half those words left unreadable, but it may never supply one they
+// never gave.
+//
+// This exists because the opposite failed in production. Asked for their level,
+// a learner answered "i dont have knowledge"; the model helpfully filled in
+// days=["Mon"], hoursPerWeek=2 alongside it. That completed the availability,
+// so the interview never asked the question, the recap reported "2 hours per
+// week on Mon" as though the learner had said it, and the plan was built and
+// scheduled against a week they had never agreed to. Removing the backend's own
+// silent default was not enough while the model could still invent one — and an
+// invented availability is unrecoverable downstream, because nothing can tell it
+// apart from a real answer.
+//
+// An answer the parser cannot read simply leaves availability unknown. That is
+// recoverable: the interview asks again, and failing that the verdict honestly
+// says "unknown".
+func recordStatedAvailability(sess *IntakeSession, latest, askAbout string, modelAnswers map[string]string) {
+	st := parseAvailabilityStatement(latest)
+	if st.empty() {
+		return // the learner said nothing about when they can study
+	}
+	// Resolved against what is already known, so a per-day rate lands on the
+	// days already in force: "5h/day" to someone studying seven days is
+	// thirty-five hours a week, and they should not have to restate their week
+	// to change its length. The bare-number reading ("about 6") is only
+	// trustworthy when we know this reply is answering that question.
+	current := currentAvailability(sess)
+	next := resolveAvailability(current, st, askAbout == "timeBudget")
+	if availabilityFingerprint(next) == availabilityFingerprint(current) {
+		return
+	}
+
+	// The model may complete a half the learner's words left unread — "a couple
+	// of evenings after work" is a real answer the parser cannot structure — but
+	// only a half that is genuinely still missing.
+	if claim := availabilityFromModel(modelAnswers); claim.HasDays() || claim.HasTime() {
+		var fill StudyAvailability
+		if !next.HasDays() && claim.HasDays() {
+			fill.Days = claim.Days
+		}
+		if !next.HasTime() && claim.HasTime() {
+			fill.WeeklyMinutes = claim.WeeklyMinutes
+			fill.PerDay = claim.PerDay
+		}
+		if fill.HasDays() || fill.HasTime() {
+			next = mergeAvailability(next, fill)
+		}
+	}
+	syncAnswersAvailability(sess, next)
+	invalidateFeasibility(sess)
+}
+
+// invalidateFeasibility discards every verdict derived from the availability,
+// deadline or target that has just changed.
+//
+// Feasibility is a DERIVED value. Keeping a verdict computed from the previous
+// week is how a recap ended up showing thirty-five hours a week above a
+// capacity figure calculated from two. Nothing here is recomputed eagerly: the
+// next recap recomputes from the state as it now stands, which is the only
+// version anyone should be asked to approve.
+func invalidateFeasibility(sess *IntakeSession) {
+	sess.FeasibilityNote = ""
+	sess.FeasibilityStatus = ""
+	sess.FeasibilityAgreed = false
 }
 
 func (p *Pipeline) finishIntakeAndPlan(ctx context.Context, sess *IntakeSession) (Turn, error) {
@@ -984,7 +1420,11 @@ func (p *Pipeline) buildPlan(ctx context.Context, sess *IntakeSession) (*Plan, e
 	var pa planAI
 	if p.gw.Enabled() {
 		payload := p.buildPlanContext(sess, loc)
-		raw, err := p.gw.Chat(ctx, sess.UserID, p.cfg.ModelSmart, withLang(prompts["plan"].System, sess.Lang), payload, true, cacheKeyFor("plan", sess.Lang, payload))
+		history := conversationWindow(sess)
+		turns := stageTurns(prompts["plan"].System, sess.Lang, history, payload, "",
+			"Build the learning plan for the agreed target, inside the stated weekly minute budget.")
+		raw, err := p.gw.ChatTurns(ctx, sess.UserID, p.cfg.ModelSmart, turns, true,
+			cacheKeyForTurns("plan", sess.Lang, payload, history))
 		if err != nil {
 			return nil, err
 		}
@@ -1006,27 +1446,29 @@ func (p *Pipeline) buildPlan(ctx context.Context, sess *IntakeSession) (*Plan, e
 func materializePlan(sess *IntakeSession, pa planAI, timezone string) *Plan {
 	loc := loadLocation(timezone)
 	weeks := clamp(pa.WeeksTotal, 1, maxPlanWeeks)
-	hours, days := planAvailability(sess)
+	av, _ := planAvailability(sess)
 	start := todayIn(loc).AddDate(0, 0, 1)
 
 	plan := &Plan{
-		ID:           newID("plan"),
-		UserID:       sess.UserID,
-		GoalID:       sess.GoalID,
-		Skill:        sess.Skill,
-		Path:         sess.Path,
-		Assessment:   pa.Assessment,
-		Feasibility:  pa.Feasibility,
-		HoursPerWeek: hours,
-		Days:         days,
-		WeeksTotal:   weeks,
-		Timezone:     timezone,
-		Lang:         normLang(sess.Lang),
-		Deadline:     sess.Answers.Deadline,
-		StartDate:    dateStr(start),
-		Version:      1,
-		CreatedAt:    time.Now(),
+		ID:                newID("plan"),
+		UserID:            sess.UserID,
+		GoalID:            sess.GoalID,
+		Skill:             sess.Skill,
+		Path:              sess.Path,
+		Assessment:        pa.Assessment,
+		Feasibility:       pa.Feasibility,
+		WeeksTotal:        weeks,
+		Timezone:          timezone,
+		Lang:              normLang(sess.Lang),
+		Deadline:          sess.Answers.Deadline,
+		FeasibilityStatus: firstNonEmpty(sess.FeasibilityStatus, unknownStatus),
+		StartDate:         dateStr(start),
+		Version:           1,
+		CreatedAt:         time.Now(),
 	}
+	// One writer for the availability fields, so Days, HoursPerWeek,
+	// WeeklyMinutes and PerDay can never disagree with each other.
+	syncPlanAvailability(plan, av)
 
 	// Week ranges arriving from the model (or from a short mock plan) are
 	// clamped into the plan, and an inverted range is repaired rather than
@@ -1071,16 +1513,20 @@ func materializePlan(sess *IntakeSession, pa planAI, timezone string) *Plan {
 	}
 	for _, s := range pa.SetupItems {
 		plan.SetupItems = append(plan.SetupItems, SetupItem{
-			ID:         newID("item"),
-			PlanID:     plan.ID,
-			Name:       s.Name,
-			Category:   s.Category,
-			Priority:   normalizePriority(s.Priority),
-			PriceRange: s.PriceRange,
-			Owned:      s.Owned,
-			Rationale:  s.Rationale,
+			ID:          newID("item"),
+			PlanID:      plan.ID,
+			Name:        s.Name,
+			Category:    s.Category,
+			Priority:    normalizePriority(s.Priority),
+			PriceRange:  s.PriceRange,
+			Owned:       s.Owned,
+			Rationale:   s.Rationale,
+			SearchQuery: cleanShopQuery(s.SearchQuery),
 		})
 	}
+	// Record what was recommended, so a later "I bought a different one" has
+	// something concrete to replace.
+	seedResources(plan)
 	return plan
 }
 
@@ -1133,9 +1579,17 @@ func withReply(reply, question string) string {
 	return reply + "\n\n" + question
 }
 
-// answersFingerprint captures the fields the confirmation recap is computed
-// from, so a change to any of them triggers a fresh recap.
+// answersFingerprint captures every field the confirmation recap is computed
+// from, so a change to any of them forces a fresh recap.
+//
+// It uses the full availability fingerprint rather than the rounded
+// HoursPerWeek mirror: a change from "2 hours on seven days" to "2 hours on
+// three days" leaves the mirror untouched while halving the capacity, and a
+// recap that did not notice would show new days above an old total.
 func answersFingerprint(sess *IntakeSession) string {
 	a := sess.Answers
-	return strings.Join([]string{a.Target, a.Deadline, itoa(a.HoursPerWeek), strings.Join(a.Days, ",")}, "|")
+	return strings.Join([]string{
+		a.Target, a.Deadline, a.CurrentLevel,
+		availabilityFingerprint(currentAvailability(sess)),
+	}, "|")
 }

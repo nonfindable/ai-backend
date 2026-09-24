@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type API struct {
@@ -197,10 +198,7 @@ func (a *API) handleSession(w http.ResponseWriter, r *http.Request) {
 		ID: newID("sess"), UserID: user.ID, Stage: "scope_check", Lang: lang,
 		AnswerBag: map[string]string{}, CreatedAt: time.Now(),
 	}
-	greeting := tr(lang,
-		"Hi! I'm start.ai. Tell me something you want to learn — like “IELTS 7.0 by October” or “learn guitar” — and I'll build you a scheduled plan.",
-		"Привет! Я start.ai. Скажите, что вы хотите освоить — например, «IELTS 7.0 к октябрю» или «научиться играть на гитаре» — и я составлю вам план с расписанием.",
-		"Salom! Men start.ai. Nimani o'rganmoqchi ekaningizni ayting — masalan, «Oktyabrga IELTS 7.0» yoki «gitara o'rganish» — men sizga jadvalli reja tuzib beraman.")
+	greeting := sessionGreeting(lang, req.Name)
 	sess.Messages = append(sess.Messages, Message{Role: "assistant", Content: greeting, At: time.Now()})
 	a.store.SaveSession(sess)
 
@@ -213,6 +211,42 @@ func (a *API) handleSession(w http.ResponseWriter, r *http.Request) {
 		resp["token"] = token
 	}
 	writeJSON(w, 200, resp)
+}
+
+// maxGreetingNameRunes caps the name echoed into the greeting, so an
+// oversized name cannot swamp the first message.
+const maxGreetingNameRunes = 40
+
+// sessionGreeting is the opening assistant message, addressed by name when
+// the request carried one. The name is inserted as plain text: clients render
+// assistant messages as text, never as HTML.
+func sessionGreeting(lang, name string) string {
+	const (
+		en = " 👋 I'm start.ai, your learning coach. What would you like to learn? Just tell me in your own words — I'll ask a few quick questions and build a step-by-step plan that fits your schedule."
+		ru = " 👋 Я start.ai — ваш помощник в учёбе. Что хотите изучить? Просто напишите своими словами — я задам пару коротких вопросов и составлю пошаговый план под ваш график."
+		uz = " 👋 Men start.ai — o'qishdagi yordamchingizman. Nimani o'rganmoqchisiz? O'z so'zlaringiz bilan yozing — men bir nechta qisqa savol beraman va vaqtingizga mos bosqichma-bosqich reja tuzib beraman."
+	)
+	name = greetingName(name)
+	if name == "" {
+		return tr(lang, "Hi there!"+en, "Привет!"+ru, "Salom!"+uz)
+	}
+	return tr(lang, "Hi "+name+"!"+en, "Привет, "+name+"!"+ru, "Salom, "+name+"!"+uz)
+}
+
+// greetingName trims the name, folds any line breaks or control characters
+// into spaces so it stays on one line, and caps it at maxGreetingNameRunes.
+func greetingName(name string) string {
+	name = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, name)
+	name = strings.Join(strings.Fields(name), " ")
+	if r := []rune(name); len(r) > maxGreetingNameRunes {
+		name = strings.TrimSpace(string(r[:maxGreetingNameRunes]))
+	}
+	return name
 }
 
 type chatReq struct {
@@ -265,7 +299,7 @@ func (a *API) handlePlan(w http.ResponseWriter, r *http.Request, user *User) {
 		writeAPIError(w, 404, codePlanNotFound)
 		return
 	}
-	writeJSON(w, 200, plan)
+	writeJSON(w, 200, withShopLinks(plan, a.cfg.MarketplaceCountry))
 }
 
 type planRef struct {
